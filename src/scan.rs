@@ -545,7 +545,8 @@ fn main() {
             }
         };
         let pinned = parse_arg(&args, "--run-id").and_then(|r| r.parse::<i64>().ok());
-        run_agent(&coordinator, &key, &worker_id, lease_sec, &token, &chat, pinned, threads);
+        let targets_file = parse_arg(&args, "--targets");
+        run_agent(&coordinator, &key, &worker_id, lease_sec, &token, &chat, pinned, threads, targets_file.as_deref());
         return;
     }
 
@@ -575,7 +576,7 @@ fn main() {
                 process::exit(1);
             }
         };
-        run_distributed(&coordinator, &key, run_id, &worker_id, lease_sec, &token, &chat, threads);
+        run_distributed(&coordinator, &key, run_id, &worker_id, lease_sec, &token, &chat, threads, parse_arg(&args, "--targets").as_deref());
         return;
     }
 
@@ -584,7 +585,7 @@ fn main() {
     if single.is_none() && file.is_none() {
         eprintln!("Usage: ephil-scan [--target ADDR | --file LIST] [--from N] [--to N] [--threads T]");
         eprintln!("Distributed: ephil-scan --run-id N [--worker-id NAME] [--coordinator URL] [--key KEY] [--lease-sec S] [--threads T]");
-        eprintln!("Agent: ephil-scan --agent [--run-id N] [--worker-id NAME] [--coordinator URL] [--key KEY] [--threads T]");
+        eprintln!("Agent: ephil-scan --agent [--run-id N] [--worker-id NAME] [--coordinator URL] [--key KEY] [--threads T] [--targets FILE]");
         eprintln!("  (worker id is assigned by the coordinator; NAME is just a label; threads default to all cores)");
         eprintln!("Telegram config via env: EPHIL_TG_TOKEN, EPHIL_TG_CHAT");
         process::exit(1);
@@ -787,6 +788,8 @@ struct WorkerCtx {
     key: String,
     token: String,
     chat: String,
+    file_targets: HashSet<[u8; 20]>,
+    file_addr: HashMap<[u8; 20], String>,
 }
 
 impl WorkerCtx {
@@ -811,6 +814,11 @@ impl WorkerCtx {
             None => {
                 eprintln!("invalid target from coordinator: {}", target_addr);
                 return;
+            }
+        }
+        for (h, a) in &self.file_addr {
+            if targets.insert(*h) {
+                amap.insert(*h, a.clone());
             }
         }
 
@@ -956,6 +964,7 @@ fn run_distributed(
     token: &str,
     chat: &str,
     threads: usize,
+    targets_file: Option<&str>,
 ) {
     install_signal_handlers();
     let worker_id = register_and_join(coordinator, key, worker_name, lease_sec);
@@ -976,11 +985,20 @@ fn run_distributed(
         run.id, run.name, run.target_addr, run.chunk_size
     );
 
+    let (ft, fa) = match targets_file {
+        Some(p) => {
+            let (s, m, _) = load_targets(p);
+            (s, m)
+        }
+        None => (HashSet::new(), HashMap::new()),
+    };
     let ctx = WorkerCtx {
         coordinator: coordinator.to_string(),
         key: key.to_string(),
         token: token.to_string(),
         chat: chat.to_string(),
+        file_targets: ft,
+        file_addr: fa,
     };
     let total = Arc::new(AtomicU64::new(0));
     let t2 = Arc::clone(&total);
@@ -1034,6 +1052,7 @@ fn run_agent(
     chat: &str,
     pinned_run: Option<i64>,
     threads: usize,
+    targets_file: Option<&str>,
 ) {
     install_signal_handlers();
     let worker_id = register_and_join(coordinator, key, worker_name, lease_sec);
@@ -1047,11 +1066,20 @@ fn run_agent(
         bot_controller(&c1, &k1, worker_id, &t, &n1);
     });
 
+    let (ft, fa) = match targets_file {
+        Some(p) => {
+            let (s, m, _) = load_targets(p);
+            (s, m)
+        }
+        None => (HashSet::new(), HashMap::new()),
+    };
     let ctx = WorkerCtx {
         coordinator: coordinator.to_string(),
         key: key.to_string(),
         token: token.to_string(),
         chat: chat.to_string(),
+        file_targets: ft,
+        file_addr: fa,
     };
     let total = Arc::new(AtomicU64::new(0));
     let t2 = Arc::clone(&total);
