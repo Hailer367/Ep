@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 */6 * * *'
 
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -14,8 +16,8 @@ env:
 
 jobs:
   agent:
-    runs-on: self-hosted
-    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout ephil source
         uses: actions/checkout@v4
@@ -34,17 +36,24 @@ jobs:
           echo "addresses: $(wc -l < addresses_bech32.txt)"
           head -2 addresses_bech32.txt
 
-      - name: Stop any previous agent on this host
-        run: pkill -x ephil-scan || true
-
-      - name: Start ephil agent
+      - name: Launch ephil agent
         run: |
           nohup ./target/release/ephil-scan --agent \
             --targets "$GITHUB_WORKSPACE/addresses_bech32.txt" \
             </dev/null > ephil.log 2>&1 &
-          echo "agent started (pid $!)"
+          echo $! > agent.pid
+          echo "agent started (pid $(cat agent.pid))"
 
       - name: Confirm worker registration
         run: |
           sleep 8
           grep -a "assigned id" ephil.log || { echo "agent log:"; tail -20 ephil.log; exit 1; }
+          grep -a "thread(s)" ephil.log || true
+
+      - name: Scan while job is alive
+        run: |
+          PID=$(cat agent.pid)
+          while kill -0 "$PID" 2>/dev/null; do
+            sleep 60
+          done
+          echo "agent exited (job ending)"
