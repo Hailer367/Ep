@@ -2,6 +2,20 @@ name: Ephil Agent
 
 on:
   workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'How long to run the agent (minutes)'
+        required: true
+        default: '60'
+        type: choice
+        options:
+          - '15'
+          - '30'
+          - '60'
+          - '120'
+          - '180'
+          - '240'
+          - '300'
   push:
     branches: [main]
   schedule:
@@ -50,10 +64,36 @@ jobs:
           grep -a "assigned id" ephil.log || { echo "agent log:"; tail -20 ephil.log; exit 1; }
           grep -a "thread(s)" ephil.log || true
 
-      - name: Scan while job is alive
+      - name: Run agent for configured duration
+        env:
+          DURATION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_minutes || '300' }}
         run: |
           PID=$(cat agent.pid)
+          DURATION=$((DURATION_MINUTES * 60))
+          START=$(date +%s)
+          echo "agent pid $PID, running for ${DURATION_MINUTES} minutes"
           while kill -0 "$PID" 2>/dev/null; do
-            sleep 60
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START))
+            if [ "$ELAPSED" -ge "$DURATION" ]; then
+              echo "duration reached, requesting graceful shutdown"
+              kill -TERM "$PID"
+              for i in $(seq 1 60); do
+                if ! kill -0 "$PID" 2>/dev/null; then
+                  break
+                fi
+                sleep 2
+              done
+              if kill -0 "$PID" 2>/dev/null; then
+                echo "agent ignored SIGTERM, force killing"
+                kill -9 "$PID"
+              fi
+              echo "agent stopped after $((ELAPSED / 60)) minutes"
+              tail -5 ephil.log || true
+              exit 0
+            fi
+            sleep 10
           done
-          echo "agent exited (job ending)"
+          echo "agent exited on its own before the duration"
+          tail -20 ephil.log || true
+          exit 1
