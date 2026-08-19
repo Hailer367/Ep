@@ -1,0 +1,49 @@
+[package]
+name = "ephil"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ephil"
+path = "src/main.rs"
+
+[[bin]]
+name = "ephil-addr"
+path = "src/addr.rs"
+
+[[bin]]
+name = "ephil-build"
+path = "src/build.rs"
+
+[[bin]]
+name = "ephil-lookup"
+path = "src/lookup.rs"
+
+[[bin]]
+name = "ephil-bench"
+path = "src/bench.rs"
+
+[[bin]]
+name = "ephil-selfcheck"
+path = "src/selfcheck.rs"
+
+[[bin]]
+name = "ephil-hashbench"
+path = "src/hashbench.rs"
+
+[[bin]]
+name = "ephil-scan"
+path = "src/scan.rs"
+
+[dependencies]
+sha2 = "0.10"
+ripemd = "0.1"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
