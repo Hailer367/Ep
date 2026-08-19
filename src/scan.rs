@@ -757,6 +757,7 @@ const HELP: &str = "<b>Ephil bot</b> - distributed Bitcoin sequence scanner
 
 <b>Commands</b>
 /scan <i>&lt;address&gt;</i> [chunk] [from] [to] - start a scan run
+/scan_txt [chunk] [from] [to] - scan against the downloaded txt targets
 /stop <i>&lt;run_id&gt;</i> - stop a run
 /resume <i>&lt;run_id&gt;</i> - resume a stopped run
 /status - runs + workers summary
@@ -806,20 +807,30 @@ impl WorkerCtx {
     ) {
         let mut targets = HashSet::new();
         let mut amap = HashMap::new();
-        match ec::decode_bech32_address(target_addr) {
-            Some(h) => {
-                targets.insert(h);
-                amap.insert(h, target_addr.to_string());
-            }
-            None => {
-                eprintln!("invalid target from coordinator: {}", target_addr);
-                return;
+        if !target_addr.is_empty() {
+            match ec::decode_bech32_address(target_addr) {
+                Some(h) => {
+                    targets.insert(h);
+                    amap.insert(h, target_addr.to_string());
+                }
+                None => {
+                    eprintln!("invalid target from coordinator: {}", target_addr);
+                    return;
+                }
             }
         }
         for (h, a) in &self.file_addr {
             if targets.insert(*h) {
                 amap.insert(*h, a.clone());
             }
+        }
+        if targets.is_empty() {
+            eprintln!(
+                "worker {}: run {} has no targets (no run address and no file targets)",
+                worker, run_id
+            );
+            let _ = pg_abandon_work(&self.coordinator, &self.key, cid, worker);
+            return;
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1230,6 +1241,27 @@ fn handle_command(text: &str, coordinator: &str, key: &str) -> String {
                 Err(e) => format!("failed to start run: {}", esc_html(&e)),
             }
         }
+        "/scan_txt" => {
+            let chunk: i64 = parts
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000_000);
+            if chunk <= 0 {
+                return "chunk must be > 0".to_string();
+            }
+            let from: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+            let to: Option<i64> = parts.get(3).and_then(|s| s.parse().ok());
+            match pg_start_run(coordinator, key, "txt", "", chunk, from, to) {
+                Ok(rid) => format!(
+                    "<b>Run {} started (txt file targets)</b>\nfrom: {} | chunk: {}{}\nAgents will match generated keys against the address file they downloaded.",
+                    rid,
+                    from,
+                    chunk,
+                    to.map(|t| format!(" | to: {}", t)).unwrap_or_default()
+                ),
+                Err(e) => format!("failed to start run: {}", esc_html(&e)),
+            }
+        }
         "/stop" => {
             let run = match parts.get(1).and_then(|s| s.parse::<i64>().ok()) {
                 Some(r) => r,
@@ -1294,7 +1326,11 @@ fn status_text(coordinator: &str, key: &str) -> String {
                     r.id,
                     esc_html(&r.name),
                     r.status,
-                    esc_html(&r.target_addr),
+                    if r.target_addr.is_empty() {
+                        "(txt file)".to_string()
+                    } else {
+                        esc_html(&r.target_addr)
+                    },
                     fmt_count(r.chunk_size as u64)
                 ));
                 out.push_str(&format!(
