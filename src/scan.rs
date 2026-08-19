@@ -465,8 +465,9 @@ fn scan_range(
     gy: &ec51::Fe51,
     from: u64,
     to: u64,
-    targets: &HashSet<[u8; 20]>,
-    addr_map: &HashMap<[u8; 20], String>,
+    file_targets: &HashSet<[u8; 20]>,
+    file_addr: &HashMap<[u8; 20], String>,
+    run_targets: &[([u8; 20], String)],
     scanned: &AtomicU64,
     on_hit: &mut dyn FnMut(u64, &str),
 ) {
@@ -490,11 +491,17 @@ fn scan_range(
         for i in 0..take {
             let comp = ec51::to_compressed_inv(&pts[i], &zs[i]);
             let h160 = ec51::hash160_fast(&comp);
-            if targets.contains(&h160) {
+            if file_targets.contains(&h160) || run_targets.iter().any(|(h, _)| *h == h160) {
                 let found = n + i as u64;
-                let addr = addr_map
+                let addr = file_addr
                     .get(&h160)
                     .cloned()
+                    .or_else(|| {
+                        run_targets
+                            .iter()
+                            .find(|(h, _)| *h == h160)
+                            .map(|(_, a)| a.clone())
+                    })
                     .unwrap_or_else(|| "unknown".to_string());
                 on_hit(found, &addr);
             }
@@ -741,7 +748,7 @@ fn worker(
                 Err(e) => eprintln!("telegram: {}", e),
             }
         };
-        scan_range(&gx, &gy, start_scalar, end, targets, addr_map, scanned, &mut on_hit);
+        scan_range(&gx, &gy, start_scalar, end, targets, addr_map, &[], scanned, &mut on_hit);
         head.fetch_max(end, Ordering::Relaxed);
 
         match start_scalar.checked_add(CHUNK.checked_mul(stride).unwrap()) {
@@ -805,26 +812,18 @@ impl WorkerCtx {
         lease_sec: i32,
         worker: &str,
     ) {
-        let mut targets = HashSet::new();
-        let mut amap = HashMap::new();
-        if !target_addr.is_empty() {
+        let run_targets: Vec<([u8; 20], String)> = if target_addr.is_empty() {
+            Vec::new()
+        } else {
             match ec::decode_bech32_address(target_addr) {
-                Some(h) => {
-                    targets.insert(h);
-                    amap.insert(h, target_addr.to_string());
-                }
+                Some(h) => vec![(h, target_addr.to_string())],
                 None => {
                     eprintln!("invalid target from coordinator: {}", target_addr);
                     return;
                 }
             }
-        }
-        for (h, a) in &self.file_addr {
-            if targets.insert(*h) {
-                amap.insert(*h, a.clone());
-            }
-        }
-        if targets.is_empty() {
+        };
+        if self.file_targets.is_empty() && run_targets.is_empty() {
             eprintln!(
                 "worker {}: run {} has no targets (no run address and no file targets)",
                 worker, run_id
@@ -889,7 +888,17 @@ impl WorkerCtx {
             }
         };
 
-        scan_range(&gx, &gy, cs, ce, &targets, &amap, total, &mut on_hit);
+        scan_range(
+            &gx,
+            &gy,
+            cs,
+            ce,
+            &self.file_targets,
+            &self.file_addr,
+            &run_targets,
+            total,
+            &mut on_hit,
+        );
 
         stop.store(true, Ordering::Relaxed);
         let _ = renewer.join();
