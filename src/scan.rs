@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-const BATCH: usize = 1024;
+const BATCH: usize = 256;
 const CHUNK: u64 = 1_000_000;
 
 extern "C" {
@@ -471,44 +471,83 @@ fn scan_range(
     scanned: &AtomicU64,
     on_hit: &mut dyn FnMut(u64, &str),
 ) {
-    let mut p = ec51::scalar_mult(&[from, 0, 0, 0], gx, gy);
+    const STRIDE: usize = 8;
+    // step = STRIDE * G, affine (once per chunk)
+    let step = ec51::scalar_mult(&[STRIDE as u64, 0, 0, 0], gx, gy);
+    let (step_x, step_y) = ec51::to_affine(&step);
+
+    // seed chains: chains[k] = (from + k) * G for k in 0..STRIDE
+    let mut chains: [ec51::Jacobian51; STRIDE] = [ec51::INF; STRIDE];
+    chains[0] = ec51::scalar_mult(&[from, 0, 0, 0], gx, gy);
+    for k in 1..STRIDE {
+        chains[k] = ec51::point_add(&chains[k - 1], gx, gy);
+    }
+
+    let mut pts: Vec<ec51::Jacobian51> = Vec::with_capacity(BATCH * STRIDE);
+    let mut zs: Vec<ec51::Fe51> = Vec::with_capacity(BATCH * STRIDE);
+    let mut comps8: [[u8; 33]; STRIDE] = [[0; 33]; STRIDE];
+
     let mut n = from;
-    let mut pts: Vec<ec51::Jacobian51> = Vec::with_capacity(BATCH);
-    let mut zs: Vec<ec51::Fe51> = Vec::with_capacity(BATCH);
-    while n < to {
-        let take = std::cmp::min(BATCH as u64, to - n) as usize;
+    while to - n >= STRIDE as u64 {
+        let groups = std::cmp::min(BATCH as u64, (to - n) / STRIDE as u64) as usize;
         pts.clear();
         zs.clear();
-        let mut cur = p;
-        for _ in 0..take {
-            pts.push(cur);
-            zs.push(cur.z);
-            cur = ec51::point_add(&cur, gx, gy);
-        }
-        p = cur;
-        ec51::batch_invert(&mut zs);
-
-        for i in 0..take {
-            let comp = ec51::to_compressed_inv(&pts[i], &zs[i]);
-            let h160 = ec51::hash160_fast(&comp);
-            if file_targets.contains(&h160) || run_targets.iter().any(|(h, _)| *h == h160) {
-                let found = n + i as u64;
-                let addr = file_addr
-                    .get(&h160)
-                    .cloned()
-                    .or_else(|| {
-                        run_targets
-                            .iter()
-                            .find(|(h, _)| *h == h160)
-                            .map(|(_, a)| a.clone())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-                on_hit(found, &addr);
+        for _ in 0..groups {
+            for k in 0..STRIDE {
+                pts.push(chains[k]);
+                zs.push(chains[k].z);
+                chains[k] = ec51::point_add(&chains[k], &step_x, &step_y);
             }
         }
-        n += take as u64;
-        scanned.fetch_add(take as u64, Ordering::Relaxed);
+        ec51::batch_invert(&mut zs);
+        for g in 0..groups {
+            for k in 0..STRIDE {
+                comps8[k] = ec51::to_compressed_inv(&pts[g * STRIDE + k], &zs[g * STRIDE + k]);
+            }
+            let hashes = ec51::hash160_fast33_8x(&comps8);
+            for k in 0..STRIDE {
+                let h = hashes[k];
+                if file_targets.contains(&h) || run_targets.iter().any(|(rh, _)| *rh == h) {
+                    let found = n + (g * STRIDE + k) as u64;
+                    let addr = file_addr
+                        .get(&h)
+                        .cloned()
+                        .or_else(|| {
+                            run_targets
+                                .iter()
+                                .find(|(rh, _)| *rh == h)
+                                .map(|(_, a)| a.clone())
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    on_hit(found, &addr);
+                }
+            }
+        }
+        n += (groups * STRIDE) as u64;
+        scanned.fetch_add((groups * STRIDE) as u64, Ordering::Relaxed);
     }
+    // tail: fewer than STRIDE keys remain; chains[k] == (n + k) * G
+    let tail = (to - n) as usize;
+    for k in 0..tail {
+        let zi = ec51::fe_inv(&chains[k].z);
+        let comp = ec51::to_compressed_inv(&chains[k], &zi);
+        let h = ec51::hash160_fast33(&comp);
+        if file_targets.contains(&h) || run_targets.iter().any(|(rh, _)| *rh == h) {
+            let found = n + k as u64;
+            let addr = file_addr
+                .get(&h)
+                .cloned()
+                .or_else(|| {
+                    run_targets
+                        .iter()
+                        .find(|(rh, _)| *rh == h)
+                        .map(|(_, a)| a.clone())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            on_hit(found, &addr);
+        }
+    }
+    scanned.fetch_add(tail as u64, Ordering::Relaxed);
 }
 
 fn main() {

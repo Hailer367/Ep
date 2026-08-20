@@ -376,18 +376,32 @@ pub fn batch_invert(zs: &mut [Fe51]) {
         return;
     }
     let mut prefix = Vec::with_capacity(n);
-    let mut acc = zs[0];
-    prefix.push(acc);
-    for i in 1..n {
-        acc = fe_mul(&acc, &zs[i]);
+    let mut acc = ONE;
+    let mut zeros = 0usize;
+    for i in 0..n {
         prefix.push(acc);
+        if zs[i][0] | zs[i][1] | zs[i][2] | zs[i][3] | zs[i][4] == 0 {
+            zeros += 1;
+        } else {
+            acc = fe_mul(&acc, &zs[i]);
+        }
+    }
+    if zeros > 1 {
+        for z in zs.iter_mut() {
+            *z = [0; 5];
+        }
+        return;
     }
     let mut inv = fe_inv(&acc);
     for i in (0..n).rev() {
-        let zi = zs[i];
-        let pprev = if i == 0 { ONE } else { prefix[i - 1] };
-        zs[i] = fe_mul(&inv, &pprev);
-        inv = fe_mul(&inv, &zi);
+        if zs[i][0] | zs[i][1] | zs[i][2] | zs[i][3] | zs[i][4] == 0 {
+            zs[i] = [0; 5];
+        } else {
+            let zi = zs[i];
+            let pprev = prefix[i];
+            zs[i] = fe_mul(&inv, &pprev);
+            inv = fe_mul(&inv, &zi);
+        }
     }
 }
 
@@ -542,7 +556,7 @@ macro_rules! rl {
     };
 }
 
-fn compress_ripemd(h: &mut [u32; 5], block: &[u8; 64]) {
+pub fn compress_ripemd(h: &mut [u32; 5], block: &[u8; 64]) {
     let mut x = [0u32; 16];
     for i in 0..16 {
         x[i] = u32::from_le_bytes([
@@ -777,4 +791,554 @@ pub fn ripemd160_opt(data: &[u8]) -> [u8; 20] {
 pub fn hash160_fast(compressed: &[u8]) -> [u8; 20] {
     let h1 = sha2::Sha256::digest(compressed);
     ripemd160_opt(&h1)
+}
+
+// ---- optimized single-block hash160 path (33-byte compressed -> 20-byte hash160) ----
+
+const K32X4: [[u32; 4]; 16] = [
+    [0xe9b5dba5, 0xb5c0fbcf, 0x71374491, 0x428a2f98],
+    [0xab1c5ed5, 0x923f82a4, 0x59f111f1, 0x3956c25b],
+    [0x550c7dc3, 0x243185be, 0x12835b01, 0xd807aa98],
+    [0xc19bf174, 0x9bdc06a7, 0x80deb1fe, 0x72be5d74],
+    [0x240ca1cc, 0x0fc19dc6, 0xefbe4786, 0xe49b69c1],
+    [0x76f988da, 0x5cb0a9dc, 0x4a7484aa, 0x2de92c6f],
+    [0xbf597fc7, 0xb00327c8, 0xa831c66d, 0x983e5152],
+    [0x14292967, 0x06ca6351, 0xd5a79147, 0xc6e00bf3],
+    [0x53380d13, 0x4d2c6dfc, 0x2e1b2138, 0x27b70a85],
+    [0x92722c85, 0x81c2c92e, 0x766a0abb, 0x650a7354],
+    [0xc76c51a3, 0xc24b8b70, 0xa81a664b, 0xa2bfe8a1],
+    [0x106aa070, 0xf40e3585, 0xd6990624, 0xd192e819],
+    [0x34b0bcb5, 0x2748774c, 0x1e376c08, 0x19a4c116],
+    [0x682e6ff3, 0x5b9cca4f, 0x4ed8aa4a, 0x391c0cb3],
+    [0x8cc70208, 0x84c87814, 0x78a5636f, 0x748f82ee],
+    [0xc67178f2, 0xbef9a3f7, 0xa4506ceb, 0x90befffa],
+];
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sha_schedule(v0: core::arch::x86_64::__m128i, v1: core::arch::x86_64::__m128i, v2: core::arch::x86_64::__m128i, v3: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    use core::arch::x86_64::*;
+    let t1 = _mm_sha256msg1_epu32(v0, v1);
+    let t2 = _mm_alignr_epi8(v3, v2, 4);
+    let t3 = _mm_add_epi32(t1, t2);
+    _mm_sha256msg2_epu32(t3, v3)
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! sha_rounds4 {
+    ($abef:ident, $cdgh:ident, $rest:expr, $i:expr) => {{
+        let k = K32X4[$i];
+        let kv = core::arch::x86_64::_mm_set_epi32(k[0] as i32, k[1] as i32, k[2] as i32, k[3] as i32);
+        let t1 = core::arch::x86_64::_mm_add_epi32($rest, kv);
+        $cdgh = core::arch::x86_64::_mm_sha256rnds2_epu32($cdgh, $abef, t1);
+        let t2 = core::arch::x86_64::_mm_shuffle_epi32(t1, 0x0E);
+        $abef = core::arch::x86_64::_mm_sha256rnds2_epu32($abef, $cdgh, t2);
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! sha_schedule_rounds4 {
+    ($abef:ident, $cdgh:ident, $w0:expr, $w1:expr, $w2:expr, $w3:expr, $w4:expr, $i:expr) => {{
+        $w4 = sha_schedule($w0, $w1, $w2, $w3);
+        sha_rounds4!($abef, $cdgh, $w4, $i);
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+unsafe fn sha256_block_ni(state: &mut [u32; 8], block: &[u8; 64]) {
+    use core::arch::x86_64::*;
+    let mask: __m128i = _mm_set_epi64x(
+        0x0C0D_0E0F_0809_0A0Bu64 as i64,
+        0x0405_0607_0001_0203u64 as i64,
+    );
+    let state_ptr = state.as_ptr() as *const __m128i;
+    let dcba = _mm_loadu_si128(state_ptr.add(0));
+    let efgh = _mm_loadu_si128(state_ptr.add(1));
+    let cdab = _mm_shuffle_epi32(dcba, 0xB1);
+    let efgh = _mm_shuffle_epi32(efgh, 0x1B);
+    let mut abef = _mm_alignr_epi8(cdab, efgh, 8);
+    let mut cdgh = _mm_blend_epi16(efgh, cdab, 0xF0);
+    let abef_save = abef;
+    let cdgh_save = cdgh;
+
+    let data_ptr = block.as_ptr() as *const __m128i;
+    let mut w0 = _mm_shuffle_epi8(_mm_loadu_si128(data_ptr.add(0)), mask);
+    let mut w1 = _mm_shuffle_epi8(_mm_loadu_si128(data_ptr.add(1)), mask);
+    let mut w2 = _mm_shuffle_epi8(_mm_loadu_si128(data_ptr.add(2)), mask);
+    let mut w3 = _mm_shuffle_epi8(_mm_loadu_si128(data_ptr.add(3)), mask);
+    let mut w4;
+
+    sha_rounds4!(abef, cdgh, w0, 0);
+    sha_rounds4!(abef, cdgh, w1, 1);
+    sha_rounds4!(abef, cdgh, w2, 2);
+    sha_rounds4!(abef, cdgh, w3, 3);
+    sha_schedule_rounds4!(abef, cdgh, w0, w1, w2, w3, w4, 4);
+    sha_schedule_rounds4!(abef, cdgh, w1, w2, w3, w4, w0, 5);
+    sha_schedule_rounds4!(abef, cdgh, w2, w3, w4, w0, w1, 6);
+    sha_schedule_rounds4!(abef, cdgh, w3, w4, w0, w1, w2, 7);
+    sha_schedule_rounds4!(abef, cdgh, w4, w0, w1, w2, w3, 8);
+    sha_schedule_rounds4!(abef, cdgh, w0, w1, w2, w3, w4, 9);
+    sha_schedule_rounds4!(abef, cdgh, w1, w2, w3, w4, w0, 10);
+    sha_schedule_rounds4!(abef, cdgh, w2, w3, w4, w0, w1, 11);
+    sha_schedule_rounds4!(abef, cdgh, w3, w4, w0, w1, w2, 12);
+    sha_schedule_rounds4!(abef, cdgh, w4, w0, w1, w2, w3, 13);
+    sha_schedule_rounds4!(abef, cdgh, w0, w1, w2, w3, w4, 14);
+    sha_schedule_rounds4!(abef, cdgh, w1, w2, w3, w4, w0, 15);
+
+    abef = _mm_add_epi32(abef, abef_save);
+    cdgh = _mm_add_epi32(cdgh, cdgh_save);
+
+    let feba = _mm_shuffle_epi32(abef, 0x1B);
+    let dchg = _mm_shuffle_epi32(cdgh, 0xB1);
+    let dcba = _mm_blend_epi16(feba, dchg, 0xF0);
+    let hgef = _mm_alignr_epi8(dchg, feba, 8);
+    let state_ptr_mut = state.as_mut_ptr() as *mut __m128i;
+    _mm_storeu_si128(state_ptr_mut.add(0), dcba);
+    _mm_storeu_si128(state_ptr_mut.add(1), hgef);
+}
+
+const SHA256_IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+// SHA-256 of a 33-byte message (one block: 33 + 0x80 + zeros + len 264).
+pub fn sha256_of_33(inp: &[u8; 33]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    block[..33].copy_from_slice(inp);
+    block[33] = 0x80;
+    block[56..64].copy_from_slice(&264u64.to_be_bytes());
+    let mut state = SHA256_IV;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sha") {
+        unsafe {
+            sha256_block_ni(&mut state, &block);
+        }
+        let mut out = [0u8; 32];
+        for i in 0..8 {
+            out[i * 4..i * 4 + 4].copy_from_slice(&state[i].to_be_bytes());
+        }
+        return out;
+    }
+    let d = sha2::Sha256::digest(&block);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+// RIPEMD-160 of a 32-byte message (one block: 32 + 0x80 + zeros + len 256).
+pub fn ripemd160_of_32(b32: &[u8]) -> [u8; 20] {
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(b32);
+    block[32] = 0x80;
+    block[56..64].copy_from_slice(&256u64.to_le_bytes());
+    let mut h = [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    compress_ripemd(&mut h, &block);
+    let mut out = [0u8; 20];
+    for i in 0..5 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_le_bytes());
+    }
+    out
+}
+
+// Fast hash160 of a 33-byte compressed pubkey: single-block sha256 (SHA-NI) + single-block ripemd.
+pub fn hash160_fast33(comp: &[u8; 33]) -> [u8; 20] {
+    let h1 = sha256_of_33(comp);
+    ripemd160_of_32(&h1)
+}
+
+// Convert a Jacobian point to affine (x, y) using one inversion.
+pub fn to_affine(p: &Jacobian51) -> (Fe51, Fe51) {
+    let zi = fe_inv(&p.z);
+    let zinv2 = fe_mul(&zi, &zi);
+    let x = fe_mul(&p.x, &zinv2);
+    let zinv3 = fe_mul(&zinv2, &zi);
+    let y = fe_mul(&p.y, &zinv3);
+    (x, y)
+}// ---- AVX2 8-lane RIPEMD-160 (processes 8 independent 32-byte messages) ----
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn ripemd_compress_8x(
+    xv: &[core::arch::x86_64::__m256i; 16],
+) -> [core::arch::x86_64::__m256i; 5] {
+    use core::arch::x86_64::*;
+    let all = _mm256_set1_epi32(u32::MAX as i32);
+    macro_rules! f0v {
+        ($b:expr, $c:expr, $d:expr) => {
+            _mm256_xor_si256(_mm256_xor_si256($b, $c), $d)
+        };
+    }
+    macro_rules! f1v {
+        ($b:expr, $c:expr, $d:expr) => {
+            _mm256_or_si256(_mm256_and_si256($b, $c), _mm256_andnot_si256($b, $d))
+        };
+    }
+    macro_rules! f2v {
+        ($b:expr, $c:expr, $d:expr) => {
+            _mm256_xor_si256(
+                _mm256_or_si256($b, _mm256_andnot_si256($c, all)),
+                $d,
+            )
+        };
+    }
+    macro_rules! f3v {
+        ($b:expr, $c:expr, $d:expr) => {
+            _mm256_or_si256(_mm256_and_si256($b, $d), _mm256_andnot_si256($d, $c))
+        };
+    }
+    macro_rules! f4v {
+        ($b:expr, $c:expr, $d:expr) => {
+            _mm256_xor_si256(
+                $b,
+                _mm256_or_si256($c, _mm256_andnot_si256($d, all)),
+            )
+        };
+    }
+    macro_rules! rolv {
+        ($x:expr, $s:expr) => {
+            _mm256_or_si256(_mm256_slli_epi32($x, $s), _mm256_srli_epi32($x, 32 - $s))
+        };
+    }
+    macro_rules! rl_s {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $k:expr, $s:expr, $xi:expr) => {{
+            let t = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_add_epi32($a, $f!($b, $c, $d)),
+                    xv[$xi],
+                ),
+                _mm256_set1_epi32($k as u32 as i32),
+            );
+            $a = _mm256_add_epi32(rolv!(t, $s), $e);
+            $c = rolv!($c, 10);
+        }};
+    }
+
+    let iv0 = _mm256_set1_epi32(0x67452301 as u32 as i32);
+    let iv1 = _mm256_set1_epi32(0xEFCDAB89 as u32 as i32);
+    let iv2 = _mm256_set1_epi32(0x98BADCFE as u32 as i32);
+    let iv3 = _mm256_set1_epi32(0x10325476 as u32 as i32);
+    let iv4 = _mm256_set1_epi32(0xC3D2E1F0 as u32 as i32);
+
+    let (mut a, mut b, mut c, mut d, mut e) = (iv0, iv1, iv2, iv3, iv4);
+    let (mut a2, mut b2, mut c2, mut d2, mut e2) = (iv0, iv1, iv2, iv3, iv4);
+
+    rl_s!(a, b, c, d, e, f0v, 0x00000000, 11, 0);
+    rl_s!(e, a, b, c, d, f0v, 0x00000000, 14, 1);
+    rl_s!(d, e, a, b, c, f0v, 0x00000000, 15, 2);
+    rl_s!(c, d, e, a, b, f0v, 0x00000000, 12, 3);
+    rl_s!(b, c, d, e, a, f0v, 0x00000000, 5, 4);
+    rl_s!(a, b, c, d, e, f0v, 0x00000000, 8, 5);
+    rl_s!(e, a, b, c, d, f0v, 0x00000000, 7, 6);
+    rl_s!(d, e, a, b, c, f0v, 0x00000000, 9, 7);
+    rl_s!(c, d, e, a, b, f0v, 0x00000000, 11, 8);
+    rl_s!(b, c, d, e, a, f0v, 0x00000000, 13, 9);
+    rl_s!(a, b, c, d, e, f0v, 0x00000000, 14, 10);
+    rl_s!(e, a, b, c, d, f0v, 0x00000000, 15, 11);
+    rl_s!(d, e, a, b, c, f0v, 0x00000000, 6, 12);
+    rl_s!(c, d, e, a, b, f0v, 0x00000000, 7, 13);
+    rl_s!(b, c, d, e, a, f0v, 0x00000000, 9, 14);
+    rl_s!(a, b, c, d, e, f0v, 0x00000000, 8, 15);
+
+    rl_s!(a2, b2, c2, d2, e2, f4v, 0x50A28BE6, 8, 5);
+    rl_s!(e2, a2, b2, c2, d2, f4v, 0x50A28BE6, 9, 14);
+    rl_s!(d2, e2, a2, b2, c2, f4v, 0x50A28BE6, 9, 7);
+    rl_s!(c2, d2, e2, a2, b2, f4v, 0x50A28BE6, 11, 0);
+    rl_s!(b2, c2, d2, e2, a2, f4v, 0x50A28BE6, 13, 9);
+    rl_s!(a2, b2, c2, d2, e2, f4v, 0x50A28BE6, 15, 2);
+    rl_s!(e2, a2, b2, c2, d2, f4v, 0x50A28BE6, 15, 11);
+    rl_s!(d2, e2, a2, b2, c2, f4v, 0x50A28BE6, 5, 4);
+    rl_s!(c2, d2, e2, a2, b2, f4v, 0x50A28BE6, 7, 13);
+    rl_s!(b2, c2, d2, e2, a2, f4v, 0x50A28BE6, 7, 6);
+    rl_s!(a2, b2, c2, d2, e2, f4v, 0x50A28BE6, 8, 15);
+    rl_s!(e2, a2, b2, c2, d2, f4v, 0x50A28BE6, 11, 8);
+    rl_s!(d2, e2, a2, b2, c2, f4v, 0x50A28BE6, 14, 1);
+    rl_s!(c2, d2, e2, a2, b2, f4v, 0x50A28BE6, 14, 10);
+    rl_s!(b2, c2, d2, e2, a2, f4v, 0x50A28BE6, 12, 3);
+    rl_s!(a2, b2, c2, d2, e2, f4v, 0x50A28BE6, 6, 12);
+
+    rl_s!(e, a, b, c, d, f1v, 0x5A827999, 7, 7);
+    rl_s!(d, e, a, b, c, f1v, 0x5A827999, 6, 4);
+    rl_s!(c, d, e, a, b, f1v, 0x5A827999, 8, 13);
+    rl_s!(b, c, d, e, a, f1v, 0x5A827999, 13, 1);
+    rl_s!(a, b, c, d, e, f1v, 0x5A827999, 11, 10);
+    rl_s!(e, a, b, c, d, f1v, 0x5A827999, 9, 6);
+    rl_s!(d, e, a, b, c, f1v, 0x5A827999, 7, 15);
+    rl_s!(c, d, e, a, b, f1v, 0x5A827999, 15, 3);
+    rl_s!(b, c, d, e, a, f1v, 0x5A827999, 7, 12);
+    rl_s!(a, b, c, d, e, f1v, 0x5A827999, 12, 0);
+    rl_s!(e, a, b, c, d, f1v, 0x5A827999, 15, 9);
+    rl_s!(d, e, a, b, c, f1v, 0x5A827999, 9, 5);
+    rl_s!(c, d, e, a, b, f1v, 0x5A827999, 11, 2);
+    rl_s!(b, c, d, e, a, f1v, 0x5A827999, 7, 14);
+    rl_s!(a, b, c, d, e, f1v, 0x5A827999, 13, 11);
+    rl_s!(e, a, b, c, d, f1v, 0x5A827999, 12, 8);
+
+    rl_s!(e2, a2, b2, c2, d2, f3v, 0x5C4DD124, 9, 6);
+    rl_s!(d2, e2, a2, b2, c2, f3v, 0x5C4DD124, 13, 11);
+    rl_s!(c2, d2, e2, a2, b2, f3v, 0x5C4DD124, 15, 3);
+    rl_s!(b2, c2, d2, e2, a2, f3v, 0x5C4DD124, 7, 7);
+    rl_s!(a2, b2, c2, d2, e2, f3v, 0x5C4DD124, 12, 0);
+    rl_s!(e2, a2, b2, c2, d2, f3v, 0x5C4DD124, 8, 13);
+    rl_s!(d2, e2, a2, b2, c2, f3v, 0x5C4DD124, 9, 5);
+    rl_s!(c2, d2, e2, a2, b2, f3v, 0x5C4DD124, 11, 10);
+    rl_s!(b2, c2, d2, e2, a2, f3v, 0x5C4DD124, 7, 14);
+    rl_s!(a2, b2, c2, d2, e2, f3v, 0x5C4DD124, 7, 15);
+    rl_s!(e2, a2, b2, c2, d2, f3v, 0x5C4DD124, 12, 8);
+    rl_s!(d2, e2, a2, b2, c2, f3v, 0x5C4DD124, 7, 12);
+    rl_s!(c2, d2, e2, a2, b2, f3v, 0x5C4DD124, 6, 4);
+    rl_s!(b2, c2, d2, e2, a2, f3v, 0x5C4DD124, 15, 9);
+    rl_s!(a2, b2, c2, d2, e2, f3v, 0x5C4DD124, 13, 1);
+    rl_s!(e2, a2, b2, c2, d2, f3v, 0x5C4DD124, 11, 2);
+
+    rl_s!(d, e, a, b, c, f2v, 0x6ED9EBA1, 11, 3);
+    rl_s!(c, d, e, a, b, f2v, 0x6ED9EBA1, 13, 10);
+    rl_s!(b, c, d, e, a, f2v, 0x6ED9EBA1, 6, 14);
+    rl_s!(a, b, c, d, e, f2v, 0x6ED9EBA1, 7, 4);
+    rl_s!(e, a, b, c, d, f2v, 0x6ED9EBA1, 14, 9);
+    rl_s!(d, e, a, b, c, f2v, 0x6ED9EBA1, 9, 15);
+    rl_s!(c, d, e, a, b, f2v, 0x6ED9EBA1, 13, 8);
+    rl_s!(b, c, d, e, a, f2v, 0x6ED9EBA1, 15, 1);
+    rl_s!(a, b, c, d, e, f2v, 0x6ED9EBA1, 14, 2);
+    rl_s!(e, a, b, c, d, f2v, 0x6ED9EBA1, 8, 7);
+    rl_s!(d, e, a, b, c, f2v, 0x6ED9EBA1, 13, 0);
+    rl_s!(c, d, e, a, b, f2v, 0x6ED9EBA1, 6, 6);
+    rl_s!(b, c, d, e, a, f2v, 0x6ED9EBA1, 5, 13);
+    rl_s!(a, b, c, d, e, f2v, 0x6ED9EBA1, 12, 11);
+    rl_s!(e, a, b, c, d, f2v, 0x6ED9EBA1, 7, 5);
+    rl_s!(d, e, a, b, c, f2v, 0x6ED9EBA1, 5, 12);
+
+    rl_s!(d2, e2, a2, b2, c2, f2v, 0x6D703EF3, 9, 15);
+    rl_s!(c2, d2, e2, a2, b2, f2v, 0x6D703EF3, 7, 5);
+    rl_s!(b2, c2, d2, e2, a2, f2v, 0x6D703EF3, 15, 1);
+    rl_s!(a2, b2, c2, d2, e2, f2v, 0x6D703EF3, 11, 3);
+    rl_s!(e2, a2, b2, c2, d2, f2v, 0x6D703EF3, 8, 7);
+    rl_s!(d2, e2, a2, b2, c2, f2v, 0x6D703EF3, 6, 14);
+    rl_s!(c2, d2, e2, a2, b2, f2v, 0x6D703EF3, 6, 6);
+    rl_s!(b2, c2, d2, e2, a2, f2v, 0x6D703EF3, 14, 9);
+    rl_s!(a2, b2, c2, d2, e2, f2v, 0x6D703EF3, 12, 11);
+    rl_s!(e2, a2, b2, c2, d2, f2v, 0x6D703EF3, 13, 8);
+    rl_s!(d2, e2, a2, b2, c2, f2v, 0x6D703EF3, 5, 12);
+    rl_s!(c2, d2, e2, a2, b2, f2v, 0x6D703EF3, 14, 2);
+    rl_s!(b2, c2, d2, e2, a2, f2v, 0x6D703EF3, 13, 10);
+    rl_s!(a2, b2, c2, d2, e2, f2v, 0x6D703EF3, 13, 0);
+    rl_s!(e2, a2, b2, c2, d2, f2v, 0x6D703EF3, 7, 4);
+    rl_s!(d2, e2, a2, b2, c2, f2v, 0x6D703EF3, 5, 13);
+
+    rl_s!(c, d, e, a, b, f3v, 0x8F1BBCDC, 11, 1);
+    rl_s!(b, c, d, e, a, f3v, 0x8F1BBCDC, 12, 9);
+    rl_s!(a, b, c, d, e, f3v, 0x8F1BBCDC, 14, 11);
+    rl_s!(e, a, b, c, d, f3v, 0x8F1BBCDC, 15, 10);
+    rl_s!(d, e, a, b, c, f3v, 0x8F1BBCDC, 14, 0);
+    rl_s!(c, d, e, a, b, f3v, 0x8F1BBCDC, 15, 8);
+    rl_s!(b, c, d, e, a, f3v, 0x8F1BBCDC, 9, 12);
+    rl_s!(a, b, c, d, e, f3v, 0x8F1BBCDC, 8, 4);
+    rl_s!(e, a, b, c, d, f3v, 0x8F1BBCDC, 9, 13);
+    rl_s!(d, e, a, b, c, f3v, 0x8F1BBCDC, 14, 3);
+    rl_s!(c, d, e, a, b, f3v, 0x8F1BBCDC, 5, 7);
+    rl_s!(b, c, d, e, a, f3v, 0x8F1BBCDC, 6, 15);
+    rl_s!(a, b, c, d, e, f3v, 0x8F1BBCDC, 8, 14);
+    rl_s!(e, a, b, c, d, f3v, 0x8F1BBCDC, 6, 5);
+    rl_s!(d, e, a, b, c, f3v, 0x8F1BBCDC, 5, 6);
+    rl_s!(c, d, e, a, b, f3v, 0x8F1BBCDC, 12, 2);
+
+    rl_s!(c2, d2, e2, a2, b2, f1v, 0x7A6D76E9, 15, 8);
+    rl_s!(b2, c2, d2, e2, a2, f1v, 0x7A6D76E9, 5, 6);
+    rl_s!(a2, b2, c2, d2, e2, f1v, 0x7A6D76E9, 8, 4);
+    rl_s!(e2, a2, b2, c2, d2, f1v, 0x7A6D76E9, 11, 1);
+    rl_s!(d2, e2, a2, b2, c2, f1v, 0x7A6D76E9, 14, 3);
+    rl_s!(c2, d2, e2, a2, b2, f1v, 0x7A6D76E9, 14, 11);
+    rl_s!(b2, c2, d2, e2, a2, f1v, 0x7A6D76E9, 6, 15);
+    rl_s!(a2, b2, c2, d2, e2, f1v, 0x7A6D76E9, 14, 0);
+    rl_s!(e2, a2, b2, c2, d2, f1v, 0x7A6D76E9, 6, 5);
+    rl_s!(d2, e2, a2, b2, c2, f1v, 0x7A6D76E9, 9, 12);
+    rl_s!(c2, d2, e2, a2, b2, f1v, 0x7A6D76E9, 12, 2);
+    rl_s!(b2, c2, d2, e2, a2, f1v, 0x7A6D76E9, 9, 13);
+    rl_s!(a2, b2, c2, d2, e2, f1v, 0x7A6D76E9, 12, 9);
+    rl_s!(e2, a2, b2, c2, d2, f1v, 0x7A6D76E9, 5, 7);
+    rl_s!(d2, e2, a2, b2, c2, f1v, 0x7A6D76E9, 15, 10);
+    rl_s!(c2, d2, e2, a2, b2, f1v, 0x7A6D76E9, 8, 14);
+
+    rl_s!(b, c, d, e, a, f4v, 0xA953FD4E, 9, 4);
+    rl_s!(a, b, c, d, e, f4v, 0xA953FD4E, 15, 0);
+    rl_s!(e, a, b, c, d, f4v, 0xA953FD4E, 5, 5);
+    rl_s!(d, e, a, b, c, f4v, 0xA953FD4E, 11, 9);
+    rl_s!(c, d, e, a, b, f4v, 0xA953FD4E, 6, 7);
+    rl_s!(b, c, d, e, a, f4v, 0xA953FD4E, 8, 12);
+    rl_s!(a, b, c, d, e, f4v, 0xA953FD4E, 13, 2);
+    rl_s!(e, a, b, c, d, f4v, 0xA953FD4E, 12, 10);
+    rl_s!(d, e, a, b, c, f4v, 0xA953FD4E, 5, 14);
+    rl_s!(c, d, e, a, b, f4v, 0xA953FD4E, 12, 1);
+    rl_s!(b, c, d, e, a, f4v, 0xA953FD4E, 13, 3);
+    rl_s!(a, b, c, d, e, f4v, 0xA953FD4E, 14, 8);
+    rl_s!(e, a, b, c, d, f4v, 0xA953FD4E, 11, 11);
+    rl_s!(d, e, a, b, c, f4v, 0xA953FD4E, 8, 6);
+    rl_s!(c, d, e, a, b, f4v, 0xA953FD4E, 5, 15);
+    rl_s!(b, c, d, e, a, f4v, 0xA953FD4E, 6, 13);
+
+    rl_s!(b2, c2, d2, e2, a2, f0v, 0x00000000, 8, 12);
+    rl_s!(a2, b2, c2, d2, e2, f0v, 0x00000000, 5, 15);
+    rl_s!(e2, a2, b2, c2, d2, f0v, 0x00000000, 12, 10);
+    rl_s!(d2, e2, a2, b2, c2, f0v, 0x00000000, 9, 4);
+    rl_s!(c2, d2, e2, a2, b2, f0v, 0x00000000, 12, 1);
+    rl_s!(b2, c2, d2, e2, a2, f0v, 0x00000000, 5, 5);
+    rl_s!(a2, b2, c2, d2, e2, f0v, 0x00000000, 14, 8);
+    rl_s!(e2, a2, b2, c2, d2, f0v, 0x00000000, 6, 7);
+    rl_s!(d2, e2, a2, b2, c2, f0v, 0x00000000, 8, 6);
+    rl_s!(c2, d2, e2, a2, b2, f0v, 0x00000000, 13, 2);
+    rl_s!(b2, c2, d2, e2, a2, f0v, 0x00000000, 6, 13);
+    rl_s!(a2, b2, c2, d2, e2, f0v, 0x00000000, 5, 14);
+    rl_s!(e2, a2, b2, c2, d2, f0v, 0x00000000, 15, 0);
+    rl_s!(d2, e2, a2, b2, c2, f0v, 0x00000000, 13, 3);
+    rl_s!(c2, d2, e2, a2, b2, f0v, 0x00000000, 11, 9);
+    rl_s!(b2, c2, d2, e2, a2, f0v, 0x00000000, 11, 11);
+
+    let t = _mm256_add_epi32(_mm256_add_epi32(iv1, c), d2);
+    let h0 = t;
+    let h1 = _mm256_add_epi32(_mm256_add_epi32(iv2, d), e2);
+    let h2 = _mm256_add_epi32(_mm256_add_epi32(iv3, e), a2);
+    let h3 = _mm256_add_epi32(_mm256_add_epi32(iv4, a), b2);
+    let h4 = _mm256_add_epi32(_mm256_add_epi32(iv0, b), c2);
+    [h0, h1, h2, h3, h4]
+}
+
+// Build the 16 SoA message-word vectors for 8 single-block (32-byte) messages.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn ripemd_xv_8x(shas: &[[u8; 32]; 8]) -> [core::arch::x86_64::__m256i; 16] {
+    use core::arch::x86_64::*;
+    let l0 = _mm256_loadu_si256(shas[0].as_ptr() as *const __m256i);
+    let l1 = _mm256_loadu_si256(shas[1].as_ptr() as *const __m256i);
+    let l2 = _mm256_loadu_si256(shas[2].as_ptr() as *const __m256i);
+    let l3 = _mm256_loadu_si256(shas[3].as_ptr() as *const __m256i);
+    let l4 = _mm256_loadu_si256(shas[4].as_ptr() as *const __m256i);
+    let l5 = _mm256_loadu_si256(shas[5].as_ptr() as *const __m256i);
+    let l6 = _mm256_loadu_si256(shas[6].as_ptr() as *const __m256i);
+    let l7 = _mm256_loadu_si256(shas[7].as_ptr() as *const __m256i);
+
+    let t0 = _mm256_unpacklo_epi32(l0, l1);
+    let t1 = _mm256_unpackhi_epi32(l0, l1);
+    let t2 = _mm256_unpacklo_epi32(l2, l3);
+    let t3 = _mm256_unpackhi_epi32(l2, l3);
+    let t4 = _mm256_unpacklo_epi32(l4, l5);
+    let t5 = _mm256_unpackhi_epi32(l4, l5);
+    let t6 = _mm256_unpacklo_epi32(l6, l7);
+    let t7 = _mm256_unpackhi_epi32(l6, l7);
+
+    let u0 = _mm256_unpacklo_epi64(t0, t2);
+    let u1 = _mm256_unpackhi_epi64(t0, t2);
+    let u2 = _mm256_unpacklo_epi64(t1, t3);
+    let u3 = _mm256_unpackhi_epi64(t1, t3);
+    let u4 = _mm256_unpacklo_epi64(t4, t6);
+    let u5 = _mm256_unpackhi_epi64(t4, t6);
+    let u6 = _mm256_unpacklo_epi64(t5, t7);
+    let u7 = _mm256_unpackhi_epi64(t5, t7);
+
+    let mut xv: [__m256i; 16] = [_mm256_setzero_si256(); 16];
+    xv[0] = _mm256_permute2x128_si256(u0, u4, 0x20);
+    xv[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+    xv[2] = _mm256_permute2x128_si256(u2, u6, 0x20);
+    xv[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+    xv[4] = _mm256_permute2x128_si256(u0, u4, 0x31);
+    xv[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+    xv[6] = _mm256_permute2x128_si256(u2, u6, 0x31);
+    xv[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+    xv[8] = _mm256_set1_epi32(0x80);
+    xv[14] = _mm256_set1_epi32(256);
+    xv
+}
+
+// RIPEMD-160 of 8 independent 32-byte messages (single block each, from IV).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn ripemd160_of_32_8x_avx2(shas: &[[u8; 32]; 8]) -> [[u8; 20]; 8] {
+    use core::arch::x86_64::*;
+    let xv = ripemd_xv_8x(shas);
+    let hv = ripemd_compress_8x(&xv);
+    let mut tmp = [[0u8; 32]; 5];
+    for k in 0..5 {
+        _mm256_storeu_si256(tmp[k].as_mut_ptr() as *mut __m256i, hv[k]);
+    }
+    let mut out = [[0u8; 20]; 8];
+    for j in 0..8 {
+        for k in 0..5 {
+            out[j][k * 4..k * 4 + 4].copy_from_slice(&tmp[k][j * 4..j * 4 + 4]);
+        }
+    }
+    out
+}
+
+// hash160 of 8 compressed pubkeys: scalar SHA-256 (SHA-NI) + AVX2 RIPEMD, fallback to scalar.
+pub fn hash160_fast33_8x(comps8: &[[u8; 33]; 8]) -> [[u8; 20]; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        let mut shas = [[0u8; 32]; 8];
+        for i in 0..8 {
+            shas[i] = sha256_of_33(&comps8[i]);
+        }
+        return unsafe { ripemd160_of_32_8x_avx2(&shas) };
+    }
+    let mut out = [[0u8; 20]; 8];
+    for i in 0..8 {
+        out[i] = hash160_fast33(&comps8[i]);
+    }
+    out
+}// Debug: expose transposed xv vectors as scalars.
+pub fn xv_debug(shas: &[[u8; 32]; 8]) -> [[u32; 16]; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        use core::arch::x86_64::*;
+        unsafe {
+            let xv = ripemd_xv_8x(shas);
+            let mut out = [[0u32; 16]; 8];
+            for k in 0..16 {
+                let mut tmp = [0u8; 32];
+                _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, xv[k]);
+                for j in 0..8 {
+                    out[j][k] = u32::from_le_bytes([tmp[j * 4], tmp[j * 4 + 1], tmp[j * 4 + 2], tmp[j * 4 + 3]]);
+                }
+            }
+            return out;
+        }
+    }
+    let mut out = [[0u32; 16]; 8];
+    for j in 0..8 {
+        for k in 0..8 {
+            out[j][k] = u32::from_le_bytes([shas[j][k * 4], shas[j][k * 4 + 1], shas[j][k * 4 + 2], shas[j][k * 4 + 3]]);
+        }
+        out[j][8] = 0x80;
+        out[j][15] = 256;
+    }
+    out
+}// RIPEMD-160 of 8 independent 32-byte messages (AVX2 path, fallback scalar).
+pub fn ripemd160_of_32_8x(shas: &[[u8; 32]; 8]) -> [[u8; 20]; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { ripemd160_of_32_8x_avx2(shas) };
+    }
+    let mut out = [[0u8; 20]; 8];
+    for i in 0..8 {
+        out[i] = ripemd160_of_32(&shas[i]);
+    }
+    out
+}// Debug: run the AVX2 compress on the xv of 8 messages, return h scalars.
+pub fn compress_8x_debug(shas: &[[u8; 32]; 8]) -> [[u32; 5]; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        use core::arch::x86_64::*;
+        unsafe {
+            let xv = ripemd_xv_8x(shas);
+            let hv = ripemd_compress_8x(&xv);
+            let mut out = [[0u32; 5]; 8];
+            for k in 0..5 {
+                let mut tmp = [0u8; 32];
+                _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, hv[k]);
+                for j in 0..8 {
+                    out[j][k] = u32::from_le_bytes([tmp[j * 4], tmp[j * 4 + 1], tmp[j * 4 + 2], tmp[j * 4 + 3]]);
+                }
+            }
+            return out;
+        }
+    }
+    [[0u32; 5]; 8]
 }
