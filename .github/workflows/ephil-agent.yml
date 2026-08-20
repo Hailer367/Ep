@@ -19,8 +19,6 @@ on:
           - '340'
   push:
     branches: [main]
-  schedule:
-    - cron: '0 */6 * * *'
 
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
