@@ -146,6 +146,15 @@ struct PgClaim {
     target_addr: String,
 }
 
+#[derive(Deserialize)]
+struct PgClaimAny {
+    run_id: i64,
+    chunk_id: i64,
+    start_n: String,
+    end_n: String,
+    target_addr: String,
+}
+
 fn pg_call(url: &str, key: &str, fname: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
     let url = format!("{}/rest/v1/rpc/{}", url.trim_end_matches('/'), fname);
     let resp = ureq::post(&url)
@@ -385,8 +394,15 @@ fn pg_claim_any(url: &str, key: &str, worker: &str, lease: i32) -> Result<Option
         "ephil_claim_any",
         &serde_json::json!({ "p_worker": worker, "p_lease_sec": lease }),
     )?;
-    let rows: Vec<Claim> = serde_json::from_value(v).map_err(|e| format!("parse claim_any: {}", e))?;
-    Ok(rows.into_iter().next())
+    let rows: Vec<PgClaimAny> =
+        serde_json::from_value(v).map_err(|e| format!("parse claim_any: {}", e))?;
+    Ok(rows.into_iter().next().map(|c| Claim {
+        run_id: c.run_id,
+        chunk_id: c.chunk_id,
+        start_n: parse_key(&c.start_n, "start_n").unwrap_or(key::ONE),
+        end_n: parse_key(&c.end_n, "end_n").unwrap_or(key::ONE),
+        target_addr: c.target_addr,
+    }))
 }
 
 fn pg_acquire_controller(url: &str, key: &str, wid: i64, lease: i32) -> Result<bool, String> {
