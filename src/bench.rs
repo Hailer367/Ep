@@ -1,5 +1,6 @@
 mod ec;
 mod ec51;
+mod key;
 mod table;
 
 use std::env;
@@ -44,6 +45,7 @@ fn main() {
 
     if flag(&args, "--selftest") {
         selftest();
+        selftest_bigkey();
         return;
     }
 
@@ -365,5 +367,137 @@ const STRIDE: usize = 8;
             process::exit(1);
         }
     }
-    println!("selftest OK");
+println!("selftest OK");
+}
+
+fn selftest_bigkey() {
+    use key::Key;
+    let gx = ec51::fe_from_b32_limbs(&ec::GX);
+    let gy = ec51::fe_from_b32_limbs(&ec::GY);
+
+    // key.rs sanity: parse/to_string round-trip at the top of the space
+    let max = key::MAX_KEY; // 2^160
+    assert!(
+        key::parse("1461501637330902918203684832716283019655932542976").is_none(),
+        "2^160 must be rejected as a key"
+    );
+    let last_s = key::to_string(&key::sub(&max, &key::ONE));
+    assert_eq!(
+        last_s,
+        "1461501637330902918203684832716283019655932542975",
+        "2^160 - 1 string"
+    );
+    let last_k = key::parse(&last_s).expect("parse 2^160-1");
+    assert_eq!(last_k, key::sub(&max, &key::ONE), "2^160-1 round trip");
+    assert!(key::parse("0").is_none(), "0 must be rejected");
+
+// ec51 vs reference ec for 160-bit scalars (all keys < 2^160)
+    let tests: [Key; 6] = [
+        key::sub(&max, &key::ONE),
+        key::sub(&max, &key::from_u64(2)),
+        [0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210, 0xdead_beef_cafe_babe, 0],
+        [1, 0, 0x0100_0000, 0],
+        [0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff, 0, 0],
+        [7, 0, 0, 0],
+    ];
+    for &k in &tests {
+        let a = ec::hash160_of_key(&k);
+        let b = ec51::hash160_of_key51(&k);
+        if a != b {
+            println!(
+                "bigkey mismatch k={} ec={:02x?} ec51={:02x?}",
+                key::to_string(&k),
+                &a[..4],
+                &b[..4]
+            );
+            process::exit(1);
+        }
+    }
+    println!("bigkey ec/ec51 cross-check OK ({} keys)", tests.len());
+
+    // stride-walk just below the 2^160 ceiling, mirroring scan_range
+    const STRIDE: usize = 8;
+    let from = key::sub(&max, &key::from_u64(2000));
+    let to = max;
+    let step = ec51::scalar_mult(&[STRIDE as u64, 0, 0, 0], &gx, &gy);
+    let (step_x, step_y) = ec51::to_affine(&step);
+    let mut chains: [ec51::Jacobian51; STRIDE] = [ec51::INF; STRIDE];
+    chains[0] = ec51::scalar_mult(&from, &gx, &gy);
+    for k in 1..STRIDE {
+        chains[k] = ec51::point_add(&chains[k - 1], &gx, &gy);
+    }
+    let mut n = from;
+    let mut checked = 0u64;
+    let mut mismatches = 0u64;
+    let mut pts: Vec<ec51::Jacobian51> = Vec::new();
+    let mut zs: Vec<ec51::Fe51> = Vec::new();
+    let mut comps8: [[u8; 33]; STRIDE] = [[0; 33]; STRIDE];
+    while key::lt(&n, &to) {
+        let remaining = key::sub(&to, &n);
+        if remaining[1] == 0 && remaining[2] == 0 && remaining[3] == 0 && remaining[0] < STRIDE as u64
+        {
+            break;
+        }
+        let (groups_key, _rem) = key::div_small(&remaining, STRIDE as u64);
+        let groups = std::cmp::min(BATCH as u64, key::to_small(&groups_key)) as usize;
+        pts.clear();
+        zs.clear();
+        for _ in 0..groups {
+            for k in 0..STRIDE {
+                pts.push(chains[k]);
+                zs.push(chains[k].z);
+                chains[k] = ec51::point_add(&chains[k], &step_x, &step_y);
+            }
+        }
+        ec51::batch_invert(&mut zs);
+        for g in 0..groups {
+            for k in 0..STRIDE {
+                comps8[k] = ec51::to_compressed_inv(&pts[g * STRIDE + k], &zs[g * STRIDE + k]);
+            }
+            let hashes = ec51::hash160_fast33_8x(&comps8);
+            for k in 0..STRIDE {
+                let nn = key::add(&n, (g * STRIDE + k) as u64);
+                let expect = ec51::hash160_of_key51(&nn);
+                checked += 1;
+                if hashes[k] != expect {
+                    mismatches += 1;
+                    if mismatches <= 3 {
+                        println!(
+                            "mismatch n={} got={:02x?} expect={:02x?}",
+                            key::to_string(&nn),
+                            &hashes[k][..4],
+                            &expect[..4]
+                        );
+                    }
+                }
+            }
+        }
+        n = key::add(&n, (groups * STRIDE) as u64);
+    }
+    let remaining = key::sub(&to, &n);
+    let tail = key::to_small(&remaining) as usize;
+    for k in 0..tail {
+        let zi = ec51::fe_inv(&chains[k].z);
+        let comp = ec51::to_compressed_inv(&chains[k], &zi);
+        let h = ec51::hash160_fast33(&comp);
+        let nn = key::add(&n, k as u64);
+        let expect = ec51::hash160_of_key51(&nn);
+        checked += 1;
+        if h != expect {
+            mismatches += 1;
+            if mismatches <= 3 {
+                println!(
+                    "mismatch n={} got={:02x?} expect={:02x?}",
+                    key::to_string(&nn),
+                    &h[..4],
+                    &expect[..4]
+                );
+            }
+        }
+    }
+    println!("bigkey walk checked={} mismatches={}", checked, mismatches);
+    if mismatches != 0 {
+        process::exit(1);
+    }
+    println!("bigkey selftest OK");
 }

@@ -381,6 +381,12 @@ pub fn hash160_of_n(n: u64) -> [u8; 20] {
     hash160_from_compressed(&comp)
 }
 
+pub fn hash160_of_key(s: &[u64; 4]) -> [u8; 20] {
+    let p = scalar_mult(s, &GX, &GY);
+    let comp = to_compressed(&p);
+    hash160_from_compressed(&comp)
+}
+
 pub fn bech32_polymod(values: &[u8]) -> u32 {
     let gen: [u32; 5] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
     let mut chk: u32 = 1;

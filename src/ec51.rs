@@ -515,6 +515,15 @@ pub fn hash160_of_n51(n: u64) -> [u8; 20] {
     ec::hash160_from_compressed(&comp)
 }
 
+pub fn hash160_of_key51(s: &[u64; 4]) -> [u8; 20] {
+    let gx = fe_from_b32_limbs(&ec::GX);
+    let gy = fe_from_b32_limbs(&ec::GY);
+    let p = scalar_mult(s, &gx, &gy);
+    let zi = fe_inv(&p.z);
+    let comp = to_compressed_inv(&p, &zi);
+    ec::hash160_from_compressed(&comp)
+}
+
 pub fn fe_from_b32_limbs(limbs: &[u64; 4]) -> Fe51 {
     let mut bytes = [0u8; 32];
     for i in 0..4 {

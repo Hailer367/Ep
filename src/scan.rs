@@ -1,5 +1,6 @@
 mod ec;
 mod ec51;
+mod key;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -7,10 +8,13 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::process;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+
+use key::Key;
 
 const BATCH: usize = 256;
 const CHUNK: u64 = 1_000_000;
@@ -130,15 +134,15 @@ struct PgRun {
     name: String,
     target_addr: String,
     chunk_size: i64,
-    next_start: i64,
-    to_n: Option<i64>,
+    next_start: String,
+    to_n: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct PgClaim {
     chunk_id: i64,
-    start_n: u64,
-    end_n: u64,
+    start_n: String,
+    end_n: String,
     target_addr: String,
 }
 
@@ -174,13 +178,13 @@ struct RunRow {
     target_addr: String,
     chunk_size: i64,
     status: String,
-    from_n: i64,
-    to_n: Option<i64>,
+    from_n: String,
+    to_n: Option<String>,
     created_at: String,
     done_chunks: i64,
-    done_keys: i64,
+    done_keys: String,
     hits: i64,
-    frontier: i64,
+    frontier: String,
     keys_per_sec: f64,
 }
 
@@ -188,7 +192,7 @@ struct RunRow {
 struct HitRow {
     id: i64,
     run_id: i64,
-    n: i64,
+    n: String,
     address: String,
     worker: Option<String>,
     found_at: String,
@@ -212,9 +216,13 @@ struct ControllerState {
 struct Claim {
     run_id: i64,
     chunk_id: i64,
-    start_n: u64,
-    end_n: u64,
+    start_n: Key,
+    end_n: Key,
     target_addr: String,
+}
+
+fn parse_key(s: &str, what: &str) -> Result<Key, String> {
+    key::parse(s).ok_or_else(|| format!("invalid {} from coordinator: {}", what, s))
 }
 
 fn pg_claim(url: &str, key: &str, run_id: i64, worker: &str, lease: i32) -> Result<Option<Claim>, String> {
@@ -228,8 +236,8 @@ fn pg_claim(url: &str, key: &str, run_id: i64, worker: &str, lease: i32) -> Resu
     Ok(arr.into_iter().next().map(|c| Claim {
         run_id,
         chunk_id: c.chunk_id,
-        start_n: c.start_n,
-        end_n: c.end_n,
+        start_n: parse_key(&c.start_n, "start_n").unwrap_or(key::ONE),
+        end_n: parse_key(&c.end_n, "end_n").unwrap_or(key::ONE),
         target_addr: c.target_addr,
     }))
 }
@@ -258,7 +266,7 @@ fn pg_report_hit(
     url: &str,
     key: &str,
     run_id: i64,
-    n: u64,
+    n: Key,
     addr: &str,
     worker: &str,
 ) -> Result<bool, String> {
@@ -268,7 +276,7 @@ fn pg_report_hit(
         "ephil_report_hit",
         &serde_json::json!({
             "p_run_id": run_id,
-            "p_n": n,
+            "p_n": key::to_string(&n),
             "p_address": addr,
             "p_worker": worker
         }),
@@ -322,8 +330,8 @@ fn pg_start_run(
     name: &str,
     target: &str,
     chunk: i64,
-    from: i64,
-    to: Option<i64>,
+    from: Key,
+    to: Option<Key>,
 ) -> Result<i64, String> {
     let v = pg_call(
         url,
@@ -333,8 +341,8 @@ fn pg_start_run(
             "p_name": name,
             "p_target": target,
             "p_chunk_size": chunk,
-            "p_from": from,
-            "p_to": to
+            "p_from": key::to_string(&from),
+            "p_to": to.map(|t| key::to_string(&t))
         }),
     )?;
     serde_json::from_value(v).map_err(|e| format!("parse start_run: {}", e))
@@ -463,13 +471,13 @@ fn tg_get_updates(token: &str, offset: i64) -> Result<Vec<(i64, i64, i64, String
 fn scan_range(
     gx: &ec51::Fe51,
     gy: &ec51::Fe51,
-    from: u64,
-    to: u64,
+    from: Key,
+    to: Key,
     file_targets: &HashSet<[u8; 20]>,
     file_addr: &HashMap<[u8; 20], String>,
     run_targets: &[([u8; 20], String)],
     scanned: &AtomicU64,
-    on_hit: &mut dyn FnMut(u64, &str),
+    on_hit: &mut dyn FnMut(Key, &str),
 ) {
     const STRIDE: usize = 8;
     // step = STRIDE * G, affine (once per chunk)
@@ -478,7 +486,7 @@ fn scan_range(
 
     // seed chains: chains[k] = (from + k) * G for k in 0..STRIDE
     let mut chains: [ec51::Jacobian51; STRIDE] = [ec51::INF; STRIDE];
-    chains[0] = ec51::scalar_mult(&[from, 0, 0, 0], gx, gy);
+    chains[0] = ec51::scalar_mult(&from, gx, gy);
     for k in 1..STRIDE {
         chains[k] = ec51::point_add(&chains[k - 1], gx, gy);
     }
@@ -488,8 +496,13 @@ fn scan_range(
     let mut comps8: [[u8; 33]; STRIDE] = [[0; 33]; STRIDE];
 
     let mut n = from;
-    while to - n >= STRIDE as u64 {
-        let groups = std::cmp::min(BATCH as u64, (to - n) / STRIDE as u64) as usize;
+    while key::lt(&n, &to) {
+        let remaining = key::sub(&to, &n);
+        if remaining[1] == 0 && remaining[2] == 0 && remaining[3] == 0 && remaining[0] < STRIDE as u64 {
+            break;
+        }
+        let (groups_key, _rem) = key::div_small(&remaining, STRIDE as u64);
+        let groups = std::cmp::min(BATCH as u64, key::to_small(&groups_key)) as usize;
         pts.clear();
         zs.clear();
         for _ in 0..groups {
@@ -508,7 +521,7 @@ fn scan_range(
             for k in 0..STRIDE {
                 let h = hashes[k];
                 if file_targets.contains(&h) || run_targets.iter().any(|(rh, _)| *rh == h) {
-                    let found = n + (g * STRIDE + k) as u64;
+                    let found = key::add(&n, (g * STRIDE + k) as u64);
                     let addr = file_addr
                         .get(&h)
                         .cloned()
@@ -523,17 +536,18 @@ fn scan_range(
                 }
             }
         }
-        n += (groups * STRIDE) as u64;
+        n = key::add(&n, (groups * STRIDE) as u64);
         scanned.fetch_add((groups * STRIDE) as u64, Ordering::Relaxed);
     }
     // tail: fewer than STRIDE keys remain; chains[k] == (n + k) * G
-    let tail = (to - n) as usize;
+    let remaining = key::sub(&to, &n);
+    let tail = key::to_small(&remaining) as usize;
     for k in 0..tail {
         let zi = ec51::fe_inv(&chains[k].z);
         let comp = ec51::to_compressed_inv(&chains[k], &zi);
         let h = ec51::hash160_fast33(&comp);
         if file_targets.contains(&h) || run_targets.iter().any(|(rh, _)| *rh == h) {
-            let found = n + k as u64;
+            let found = key::add(&n, k as u64);
             let addr = file_addr
                 .get(&h)
                 .cloned()
@@ -660,12 +674,12 @@ fn main() {
     let targets = Arc::new(targets);
     let addr_map = Arc::new(addr_map);
 
-    let from: u64 = parse_arg(&args, "--from")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let to: Option<u64> = parse_arg(&args, "--to").and_then(|s| s.parse().ok());
+    let from: Key = parse_arg(&args, "--from")
+        .and_then(|s| key::parse(&s))
+        .unwrap_or(key::ONE);
+    let to: Option<Key> = parse_arg(&args, "--to").and_then(|s| key::parse(&s));
     if let Some(t) = to {
-        if t < from {
+        if key::lt(&t, &from) {
             eprintln!("--to must be >= --from (or omit for infinite watch)");
             process::exit(1);
         }
@@ -695,21 +709,26 @@ fn main() {
     match to {
         Some(t) => eprintln!(
             "watching [{}..{}] for {} targets, {} threads (Telegram on hit only)",
-            from, t, valid, threads
+            key::to_string(&from),
+            key::to_string(&t),
+            valid,
+            threads
         ),
         None => eprintln!(
             "watching {}..forever for {} targets, {} threads (Telegram on hit only)",
-            from, valid, threads
+            key::to_string(&from),
+            valid,
+            threads
         ),
     }
 
     let scanned = Arc::new(AtomicU64::new(0));
-    let head = Arc::new(AtomicU64::new(from));
+    let head = Arc::new(Mutex::new(from));
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(threads);
     for t in 0..threads {
-        let start_scalar = from + (t as u64) * CHUNK;
+        let start_scalar = key::add(&from, (t as u64) * CHUNK);
         let to = to;
         let stride = threads as u64;
         let scanned = Arc::clone(&scanned);
@@ -736,13 +755,13 @@ fn main() {
     loop {
         std::thread::sleep(Duration::from_secs(5));
         let s = scanned.load(Ordering::Relaxed);
-        let h = head.load(Ordering::Relaxed);
+        let h = *head.lock().unwrap();
         let elapsed = start.elapsed().as_secs_f64();
         let rate = s as f64 / elapsed / 1e6;
         eprintln!(
             "scanned {:.1} M keys, head ~ {}, {:.1} M/s",
             s as f64 / 1e6,
-            h,
+            fmt_key_compact(&h),
             rate
         );
         if to.is_some() && handles.iter().all(|h| h.is_finished()) {
@@ -755,13 +774,13 @@ fn main() {
 }
 
 fn worker(
-    mut start_scalar: u64,
-    to: Option<u64>,
+    mut start_scalar: Key,
+    to: Option<Key>,
     stride: u64,
     targets: &HashSet<[u8; 20]>,
     addr_map: &HashMap<[u8; 20], String>,
     scanned: &AtomicU64,
-    head: &AtomicU64,
+    head: &Mutex<Key>,
     token: &str,
     chat: &str,
 ) {
@@ -769,31 +788,45 @@ fn worker(
     let gy = ec51::fe_from_b32_limbs(&ec::GY);
 
     loop {
-        if let Some(ub) = to {
-            if start_scalar > ub {
-                return;
+        let ceiling = match to {
+            Some(ub) => key::add(&ub, 1),
+            None => key::MAX_KEY,
+        };
+        if !key::lt(&start_scalar, &ceiling) {
+            if to.is_none() {
+                start_scalar = key::ONE;
+                continue;
             }
+            return;
         }
+        let remaining = key::sub(&ceiling, &start_scalar);
         let mut run_len = CHUNK;
-        if let Some(ub) = to {
-            run_len = std::cmp::min(run_len, ub - start_scalar + 1);
+        if remaining[1] == 0 && remaining[2] == 0 && remaining[3] == 0 && remaining[0] < CHUNK {
+            run_len = remaining[0];
         }
-        let end = start_scalar + run_len;
-        let mut on_hit = |found: u64, addr: &str| {
-            println!("HIT n = {} address = {}", found, addr);
-            let msg = format!("Ephil scan hit\nn = {}\ntarget: {}", found, addr);
+        let end = key::add(&start_scalar, run_len);
+        let mut on_hit = |found: Key, addr: &str| {
+            println!("HIT n = {} address = {}", key::to_string(&found), addr);
+            let msg = format!(
+                "Ephil scan hit\nn = {}\ntarget: {}",
+                key::to_string(&found),
+                addr
+            );
             match tg_send(token, chat, &msg) {
                 Ok(()) => println!("telegram delivered"),
                 Err(e) => eprintln!("telegram: {}", e),
             }
         };
         scan_range(&gx, &gy, start_scalar, end, targets, addr_map, &[], scanned, &mut on_hit);
-        head.fetch_max(end, Ordering::Relaxed);
+        *head.lock().unwrap() = end;
 
-        match start_scalar.checked_add(CHUNK.checked_mul(stride).unwrap()) {
-            Some(v) => start_scalar = v,
-            None => {
-                start_scalar = 1;
+        match key::add_checked(&start_scalar, CHUNK.checked_mul(stride).unwrap()) {
+            Some(v) if key::lt(&v, &ceiling) => start_scalar = v,
+            _ => {
+                if to.is_some() {
+                    return;
+                }
+                start_scalar = key::ONE;
             }
         }
     }
@@ -813,21 +846,43 @@ const HELP: &str = "<b>Ephil bot</b> - distributed Bitcoin sequence scanner
 /debug - debug menu (run/workers/chunks/hits/system)
 /help - this message";
 
-fn fmt_count(v: u64) -> String {
-    const K: u64 = 1_000;
-    const M: u64 = 1_000_000;
-    const G: u64 = 1_000_000_000;
-    const T: u64 = 1_000_000_000_000;
+fn fmt_count_f(v: f64) -> String {
+    const K: f64 = 1_000.0;
+    const M: f64 = 1_000_000.0;
+    const G: f64 = 1_000_000_000.0;
+    const T: f64 = 1_000_000_000_000.0;
     if v >= T {
-        format!("{:.2}T", v as f64 / T as f64)
+        format!("{:.2}T", v / T)
     } else if v >= G {
-        format!("{:.2}G", v as f64 / G as f64)
+        format!("{:.2}G", v / G)
     } else if v >= M {
-        format!("{:.2}M", v as f64 / M as f64)
+        format!("{:.2}M", v / M)
     } else if v >= K {
-        format!("{:.1}K", v as f64 / K as f64)
+        format!("{:.1}K", v / K)
     } else {
-        v.to_string()
+        format!("{}", v as u64)
+    }
+}
+
+fn fmt_count(v: u64) -> String {
+    fmt_count_f(v as f64)
+}
+
+fn fmt_key_compact(k: &Key) -> String {
+    let v = key::to_f64(k);
+    if v < 1e12 {
+        format!("{}", key::to_string(k))
+    } else {
+        let e = v.log10().floor() as i32;
+        let m = v / 10f64.powi(e);
+        format!("{:.4}e{}", m, e)
+    }
+}
+
+fn fmt_key_str(s: &str) -> String {
+    match key::parse(s) {
+        Some(k) => fmt_key_compact(&k),
+        None => s.to_string(),
     }
 }
 
@@ -845,8 +900,8 @@ impl WorkerCtx {
         &self,
         run_id: i64,
         cid: i64,
-        cs: u64,
-        ce: u64,
+        cs: Key,
+        ce: Key,
         target_addr: &str,
         total: &AtomicU64,
         lease_sec: i32,
@@ -894,13 +949,14 @@ impl WorkerCtx {
 
         let gx = ec51::fe_from_b32_limbs(&ec::GX);
         let gy = ec51::fe_from_b32_limbs(&ec::GY);
-        let mut on_hit = |found: u64, addr: &str| {
+        let mut on_hit = |found: Key, addr: &str| {
+            let fs = key::to_string(&found);
             match pg_report_hit(&self.coordinator, &self.key, run_id, found, addr, worker) {
                 Ok(true) => {
-                    println!("HIT n = {} address = {}", found, addr);
+                    println!("HIT n = {} address = {}", fs, addr);
                     let msg = format!(
                         "<b>Ephil scan hit</b>\nn = <code>{}</code>\ntarget: <code>{}</code>",
-                        found,
+                        fs,
                         esc_html(addr)
                     );
                     match tg_send(&self.token, &self.chat, &msg) {
@@ -910,14 +966,14 @@ impl WorkerCtx {
                 }
                 Ok(false) => println!(
                     "HIT n = {} address = {} (already reported, no re-ping)",
-                    found, addr
+                    fs, addr
                 ),
                 Err(e) => {
-                    println!("HIT n = {} address = {}", found, addr);
+                    println!("HIT n = {} address = {}", fs, addr);
                     eprintln!("hit report failed ({}), pinging telegram anyway", e);
                     let msg = format!(
                         "<b>Ephil scan hit</b>\nn = <code>{}</code>\ntarget: <code>{}</code>",
-                        found,
+                        fs,
                         esc_html(addr)
                     );
                     match tg_send(&self.token, &self.chat, &msg) {
@@ -946,14 +1002,23 @@ impl WorkerCtx {
             let _ = pg_abandon_work(&self.coordinator, &self.key, cid, worker);
             eprintln!(
                 "worker {}: interrupted, chunk {} [{}..{}) reopened",
-                worker, cid, cs, ce
+                worker,
+                cid,
+                key::to_string(&cs),
+                key::to_string(&ce)
             );
         } else {
             match pg_finish(&self.coordinator, &self.key, cid, worker) {
                 Ok(()) => {}
                 Err(e) => eprintln!("finish: {}", e),
             }
-            eprintln!("worker {}: finished chunk {} [{}..{})", worker, cid, cs, ce);
+            eprintln!(
+                "worker {}: finished chunk {} [{}..{})",
+                worker,
+                cid,
+                key::to_string(&cs),
+                key::to_string(&ce)
+            );
         }
     }
 }
@@ -989,7 +1054,11 @@ fn worker_loop(
             Some(cl) => {
                 eprintln!(
                     "worker {}: claimed chunk {} [{}..{}) run {}",
-                    worker, cl.chunk_id, cl.start_n, cl.end_n, cl.run_id
+                    worker,
+                    cl.chunk_id,
+                    key::to_string(&cl.start_n),
+                    key::to_string(&cl.end_n),
+                    cl.run_id
                 );
                 ctx.scan_chunk(
                     cl.run_id, cl.chunk_id, cl.start_n, cl.end_n, &cl.target_addr, total,
@@ -1271,8 +1340,8 @@ fn handle_command(text: &str, coordinator: &str, key: &str) -> String {
             if chunk <= 0 {
                 return "chunk must be > 0".to_string();
             }
-            let from: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-            let to: Option<i64> = parts.get(4).and_then(|s| s.parse().ok());
+            let from: Key = parts.get(3).and_then(|s| key::parse(s)).unwrap_or(key::ONE);
+            let to: Option<Key> = parts.get(4).and_then(|s| key::parse(s));
             let name = if addr.len() > 12 {
                 format!("{}...", &addr[..12])
             } else {
@@ -1283,9 +1352,9 @@ fn handle_command(text: &str, coordinator: &str, key: &str) -> String {
                     "<b>Run {} started</b>\ntarget: <code>{}</code>\nfrom: {} | chunk: {}{}\nAll agents will pick it up automatically.",
                     rid,
                     esc_html(addr),
-                    from,
+                    key::to_string(&from),
                     chunk,
-                    to.map(|t| format!(" | to: {}", t)).unwrap_or_default()
+                    to.map(|t| format!(" | to: {}", key::to_string(&t))).unwrap_or_default()
                 ),
                 Err(e) => format!("failed to start run: {}", esc_html(&e)),
             }
@@ -1298,15 +1367,15 @@ fn handle_command(text: &str, coordinator: &str, key: &str) -> String {
             if chunk <= 0 {
                 return "chunk must be > 0".to_string();
             }
-            let from: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            let to: Option<i64> = parts.get(3).and_then(|s| s.parse().ok());
+            let from: Key = parts.get(2).and_then(|s| key::parse(s)).unwrap_or(key::ONE);
+            let to: Option<Key> = parts.get(3).and_then(|s| key::parse(s));
             match pg_start_run(coordinator, key, "txt", "", chunk, from, to) {
                 Ok(rid) => format!(
                     "<b>Run {} started (txt file targets)</b>\nfrom: {} | chunk: {}{}\nAgents will match generated keys against the address file they downloaded.",
                     rid,
-                    from,
+                    key::to_string(&from),
                     chunk,
-                    to.map(|t| format!(" | to: {}", t)).unwrap_or_default()
+                    to.map(|t| format!(" | to: {}", key::to_string(&t))).unwrap_or_default()
                 ),
                 Err(e) => format!("failed to start run: {}", esc_html(&e)),
             }
@@ -1395,7 +1464,7 @@ fn status_text(coordinator: &str, key: &str) -> String {
             }
             for r in runs {
                 let rate = if r.keys_per_sec > 0.0 {
-                    format!(" | rate: {}keys/s", fmt_count(r.keys_per_sec as u64))
+                    format!(" | rate: {}keys/s", fmt_count_f(r.keys_per_sec))
                 } else {
                     String::new()
                 };
@@ -1413,10 +1482,10 @@ fn status_text(coordinator: &str, key: &str) -> String {
                 ));
                 out.push_str(&format!(
                     "  done {} keys ({} chunks) | hits {} | frontier {}{}\n",
-                    fmt_count(r.done_keys as u64),
+                    fmt_key_str(&r.done_keys),
                     r.done_chunks,
                     r.hits,
-                    fmt_count(r.frontier as u64),
+                    fmt_key_str(&r.frontier),
                     rate
                 ));
             }
@@ -1555,10 +1624,10 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
             );
             out.push_str(&format!(
                 "  done {} keys ({} chunks) | hits {} | frontier {}\n",
-                fmt_count(ji(r, "done_keys") as u64),
+                fmt_key_str(&jstr(r, "done_keys")),
                 ji(r, "done_chunks"),
                 ji(r, "hits"),
-                fmt_count(ji(r, "frontier") as u64)
+                fmt_key_str(&jstr(r, "frontier"))
             ));
             out.push_str(&format!(
                 "  created {} ago | rate: {}keys/s (5min) / {}keys/s (overall)\n",
@@ -1584,7 +1653,7 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
                             "  {}: {} chunks ({}) | avg {} | {}..{}\n",
                             esc_html(&jstr(w, "worker")),
                             ji(w, "chunks_done"),
-                            fmt_count(ji(w, "keys_done") as u64),
+                            fmt_key_str(&jstr(w, "keys_done")),
                             fmt_ms(ji(w, "avg_ms")),
                             esc_html(&jstr(w, "first_done_at")),
                             esc_html(&jstr(w, "last_done_at"))
@@ -1596,7 +1665,9 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
                 if !tl.is_empty() {
                     let joined: Vec<String> = tl
                         .iter()
-                        .map(|t| format!("{}:{}", jstr(t, "minute"), fmt_count(ji(t, "keys") as u64)))
+                        .map(|t| {
+                            format!("{}:{}", jstr(t, "minute"), fmt_key_str(&jstr(t, "keys")))
+                        })
                         .collect();
                     out.push_str(&format!("\nTimeline (30m): {}\n", joined.join(" ")));
                 }
@@ -1611,8 +1682,8 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
                             "  #{} {} [{}..{}) overdue {}s\n",
                             ji(s, "id"),
                             esc_html(&jstr(s, "worker")),
-                            ji(s, "start_n"),
-                            ji(s, "end_n"),
+                            fmt_key_str(&jstr(s, "start_n")),
+                            fmt_key_str(&jstr(s, "end_n")),
                             ji(s, "overdue_sec")
                         ));
                     }
@@ -1626,8 +1697,8 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
                             "  #{} {} [{}..{}) {}ms\n",
                             ji(c, "id"),
                             esc_html(&jstr(c, "worker")),
-                            ji(c, "start_n"),
-                            ji(c, "end_n"),
+                            fmt_key_str(&jstr(c, "start_n")),
+                            fmt_key_str(&jstr(c, "end_n")),
                             ji(c, "ms")
                         ));
                     }
@@ -1640,7 +1711,7 @@ fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
                         out.push_str(&format!(
                             "  #{} n={} by {} at {}\n",
                             ji(h, "id"),
-                            ji(h, "n"),
+                            jstr(h, "n"),
                             esc_html(&jstr(h, "worker")),
                             esc_html(&jstr(h, "found_at"))
                         ));
@@ -1705,8 +1776,8 @@ fn debug_chunks_text(coordinator: &str, key: &str, run_id: i64, limit: i64) -> S
                             "  #{} {} [{}..{}) {}ms\n",
                             ji(c, "id"),
                             esc_html(&jstr(c, "worker")),
-                            ji(c, "start_n"),
-                            ji(c, "end_n"),
+                            fmt_key_str(&jstr(c, "start_n")),
+                            fmt_key_str(&jstr(c, "end_n")),
                             ji(c, "ms")
                         ));
                     }
@@ -1722,8 +1793,8 @@ fn debug_chunks_text(coordinator: &str, key: &str, run_id: i64, limit: i64) -> S
                             "  #{} {} [{}..{}) overdue {}s\n",
                             ji(s, "id"),
                             esc_html(&jstr(s, "worker")),
-                            ji(s, "start_n"),
-                            ji(s, "end_n"),
+                            fmt_key_str(&jstr(s, "start_n")),
+                            fmt_key_str(&jstr(s, "end_n")),
                             ji(s, "overdue_sec")
                         ));
                     }
@@ -1752,7 +1823,7 @@ fn debug_hits_text(coordinator: &str, key: &str, run_id: i64, limit: i64) -> Str
                     out.push_str(&format!(
                         "  #{} n={} by {} at {}\n<code>{}</code>\n",
                         ji(h, "id"),
-                        ji(h, "n"),
+                        jstr(h, "n"),
                         esc_html(&jstr(h, "worker")),
                         esc_html(&jstr(h, "found_at")),
                         esc_html(&jstr(h, "address"))
