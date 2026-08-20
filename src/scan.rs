@@ -771,6 +771,7 @@ const HELP: &str = "<b>Ephil bot</b> - distributed Bitcoin sequence scanner
 /workers - active workers
 /hits [run_id] - recent hits
 /shutdown - stop all active runs
+/debug - debug menu (run/workers/chunks/hits/system)
 /help - this message";
 
 fn fmt_count(v: u64) -> String {
@@ -1309,6 +1310,35 @@ fn handle_command(text: &str, coordinator: &str, key: &str) -> String {
         }
         "/status" => status_text(coordinator, key),
         "/workers" => workers_text(coordinator, key),
+        "/debug" => {
+            let sub = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+            match sub.as_str() {
+                "" => debug_menu_text(),
+                "run" => match parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                    Some(id) => debug_run_text(coordinator, key, id),
+                    None => "usage: /debug run <run_id>".to_string(),
+                },
+                "workers" => debug_workers_text(coordinator, key),
+                "chunks" => {
+                    let id = match parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                        Some(id) => id,
+                        None => return "usage: /debug chunks <run_id> [n]".to_string(),
+                    };
+                    let n: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+                    debug_chunks_text(coordinator, key, id, n)
+                }
+                "hits" => {
+                    let id = match parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                        Some(id) => id,
+                        None => return "usage: /debug hits <run_id> [n]".to_string(),
+                    };
+                    let n: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+                    debug_hits_text(coordinator, key, id, n)
+                }
+                "system" => debug_system_text(coordinator, key),
+                _ => debug_menu_text(),
+            }
+        }
         "/hits" => {
             let run = parts.get(1).and_then(|s| s.parse::<i64>().ok());
             hits_text(coordinator, key, run)
@@ -1417,4 +1447,313 @@ fn hits_text(coordinator: &str, key: &str, run: Option<i64>) -> String {
         Err(e) => out.push_str(&format!("  failed: {}\n", esc_html(&e))),
     }
     out
+}
+
+fn debug_menu_text() -> String {
+    "<b>Ephil debug menu</b>\n\n\
+/debug run &lt;id&gt; - full run report\n\
+/debug workers - worker table\n\
+/debug chunks &lt;id&gt; [n] - last chunks + stuck\n\
+/debug hits &lt;id&gt; [n] - recent hits\n\
+/debug system - coordinator health\n\
+/debug - this menu"
+        .to_string()
+}
+
+fn jstr(v: &serde_json::Value, k: &str) -> String {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+fn ji(v: &serde_json::Value, k: &str) -> i64 {
+    v.get(k).and_then(|x| x.as_i64()).unwrap_or(0)
+}
+fn jf(v: &serde_json::Value, k: &str) -> f64 {
+    v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
+}
+fn fmt_secs(s: f64) -> String {
+    if s >= 3600.0 {
+        format!("{:.1}h", s / 3600.0)
+    } else if s >= 60.0 {
+        format!("{:.0}m", s / 60.0)
+    } else {
+        format!("{:.0}s", s)
+    }
+}
+fn fmt_ms(ms: i64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}ms", ms)
+    }
+}
+
+fn debug_run_text(coordinator: &str, key: &str, run_id: i64) -> String {
+    match pg_call(
+        coordinator,
+        key,
+        "ephil_debug_run",
+        &serde_json::json!({"p_run_id": run_id}),
+    ) {
+        Ok(v) => {
+            if v.get("found").and_then(|b| b.as_bool()).unwrap_or(false) != true {
+                return format!("run {} not found", run_id);
+            }
+            let r = match v.get("run") {
+                Some(x) => x,
+                None => return "run report missing".to_string(),
+            };
+            let target = jstr(r, "target_addr");
+            let mut out = format!(
+                "<b>Debug run #{} <i>{}</i> [{}]</b> target <code>{}</code> chunk {}\n",
+                ji(r, "id"),
+                esc_html(&jstr(r, "name")),
+                jstr(r, "status"),
+                if target.is_empty() {
+                    "(txt file)".to_string()
+                } else {
+                    esc_html(&target)
+                },
+                fmt_count(ji(r, "chunk_size") as u64)
+            );
+            out.push_str(&format!(
+                "  done {} keys ({} chunks) | hits {} | frontier {}\n",
+                fmt_count(ji(r, "done_keys") as u64),
+                ji(r, "done_chunks"),
+                ji(r, "hits"),
+                fmt_count(ji(r, "frontier") as u64)
+            ));
+            out.push_str(&format!(
+                "  created {} ago | rate: {}keys/s (5min) / {}keys/s (overall)\n",
+                fmt_secs(jf(r, "elapsed_sec")),
+                fmt_count(ji(r, "rate_5min") as u64),
+                fmt_count(ji(r, "rate_overall") as u64)
+            ));
+            if let Some(c) = v.get("chunk_inventory") {
+                out.push_str(&format!(
+                    "\nChunks: total {} | done {} | claimed {} | expired {} | dup ranges {}\n",
+                    ji(c, "total"),
+                    ji(c, "done"),
+                    ji(c, "claimed"),
+                    ji(c, "claimed_expired"),
+                    ji(&v, "duplicate_ranges")
+                ));
+            }
+            if let Some(ws) = v.get("workers").and_then(|x| x.as_array()) {
+                if !ws.is_empty() {
+                    out.push_str("\n<b>Workers</b>\n");
+                    for w in ws {
+                        out.push_str(&format!(
+                            "  {}: {} chunks ({}) | avg {} | {}..{}\n",
+                            esc_html(&jstr(w, "worker")),
+                            ji(w, "chunks_done"),
+                            fmt_count(ji(w, "keys_done") as u64),
+                            fmt_ms(ji(w, "avg_ms")),
+                            esc_html(&jstr(w, "first_done_at")),
+                            esc_html(&jstr(w, "last_done_at"))
+                        ));
+                    }
+                }
+            }
+            if let Some(tl) = v.get("timeline").and_then(|x| x.as_array()) {
+                if !tl.is_empty() {
+                    let joined: Vec<String> = tl
+                        .iter()
+                        .map(|t| format!("{}:{}", jstr(t, "minute"), fmt_count(ji(t, "keys") as u64)))
+                        .collect();
+                    out.push_str(&format!("\nTimeline (30m): {}\n", joined.join(" ")));
+                }
+            }
+            if let Some(st) = v.get("stuck_chunks").and_then(|x| x.as_array()) {
+                if st.is_empty() {
+                    out.push_str("\nStuck: none\n");
+                } else {
+                    out.push_str(&format!("\n<b>Stuck {} chunk(s)</b>\n", st.len()));
+                    for s in st {
+                        out.push_str(&format!(
+                            "  #{} {} [{}..{}) overdue {}s\n",
+                            ji(s, "id"),
+                            esc_html(&jstr(s, "worker")),
+                            ji(s, "start_n"),
+                            ji(s, "end_n"),
+                            ji(s, "overdue_sec")
+                        ));
+                    }
+                }
+            }
+            if let Some(rc) = v.get("recent_chunks").and_then(|x| x.as_array()) {
+                if !rc.is_empty() {
+                    out.push_str("\n<b>Recent chunks</b>\n");
+                    for c in rc {
+                        out.push_str(&format!(
+                            "  #{} {} [{}..{}) {}ms\n",
+                            ji(c, "id"),
+                            esc_html(&jstr(c, "worker")),
+                            ji(c, "start_n"),
+                            ji(c, "end_n"),
+                            ji(c, "ms")
+                        ));
+                    }
+                }
+            }
+            if let Some(hs) = v.get("recent_hits").and_then(|x| x.as_array()) {
+                if !hs.is_empty() {
+                    out.push_str("\n<b>Recent hits</b>\n");
+                    for h in hs {
+                        out.push_str(&format!(
+                            "  #{} n={} by {} at {}\n",
+                            ji(h, "id"),
+                            ji(h, "n"),
+                            esc_html(&jstr(h, "worker")),
+                            esc_html(&jstr(h, "found_at"))
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        Err(e) => format!("debug_run failed: {}", esc_html(&e)),
+    }
+}
+
+fn debug_workers_text(coordinator: &str, key: &str) -> String {
+    match pg_call(coordinator, key, "ephil_debug_workers", &serde_json::json!({})) {
+        Ok(v) => {
+            let arr = v.as_array().cloned().unwrap_or_default();
+            if arr.is_empty() {
+                return "no workers".to_string();
+            }
+            let mut out = String::from("<b>Workers</b>\n");
+            for w in arr {
+                out.push_str(&format!(
+                    "#{} <code>{}</code> [{}] lag {}s lease {}s in-flight {} 5m-chunks {}\n",
+                    ji(&w, "id"),
+                    esc_html(&jstr(&w, "name")),
+                    jstr(&w, "status"),
+                    ji(&w, "heartbeat_lag_sec"),
+                    ji(&w, "lease_remaining_sec"),
+                    ji(&w, "in_flight"),
+                    ji(&w, "done_chunks_5min")
+                ));
+            }
+            out
+        }
+        Err(e) => format!("debug_workers failed: {}", esc_html(&e)),
+    }
+}
+
+fn debug_chunks_text(coordinator: &str, key: &str, run_id: i64, limit: i64) -> String {
+    match pg_call(
+        coordinator,
+        key,
+        "ephil_debug_chunks",
+        &serde_json::json!({"p_run_id": run_id, "p_limit": limit}),
+    ) {
+        Ok(v) => {
+            let mut out = format!("<b>Chunks run #{}</b>\n", run_id);
+            if let Some(c) = v.get("counts") {
+                out.push_str(&format!(
+                    "  total {} | done {} | claimed {} | stuck {}\n",
+                    ji(c, "total"),
+                    ji(c, "done"),
+                    ji(c, "claimed"),
+                    ji(c, "stuck")
+                ));
+            }
+            if let Some(l) = v.get("latest").and_then(|x| x.as_array()) {
+                if !l.is_empty() {
+                    out.push_str(&format!("\n<b>Latest {}</b>\n", l.len()));
+                    for c in l {
+                        out.push_str(&format!(
+                            "  #{} {} [{}..{}) {}ms\n",
+                            ji(c, "id"),
+                            esc_html(&jstr(c, "worker")),
+                            ji(c, "start_n"),
+                            ji(c, "end_n"),
+                            ji(c, "ms")
+                        ));
+                    }
+                }
+            }
+            if let Some(st) = v.get("stuck").and_then(|x| x.as_array()) {
+                if st.is_empty() {
+                    out.push_str("\nStuck: none\n");
+                } else {
+                    out.push_str(&format!("\n<b>Stuck {}</b>\n", st.len()));
+                    for s in st {
+                        out.push_str(&format!(
+                            "  #{} {} [{}..{}) overdue {}s\n",
+                            ji(s, "id"),
+                            esc_html(&jstr(s, "worker")),
+                            ji(s, "start_n"),
+                            ji(s, "end_n"),
+                            ji(s, "overdue_sec")
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        Err(e) => format!("debug_chunks failed: {}", esc_html(&e)),
+    }
+}
+
+fn debug_hits_text(coordinator: &str, key: &str, run_id: i64, limit: i64) -> String {
+    match pg_call(
+        coordinator,
+        key,
+        "ephil_debug_hits",
+        &serde_json::json!({"p_run_id": run_id, "p_limit": limit}),
+    ) {
+        Ok(v) => {
+            let mut out = format!("<b>Hits run #{} total {}</b>\n", run_id, ji(&v, "total"));
+            if let Some(hs) = v.get("hits").and_then(|x| x.as_array()) {
+                if hs.is_empty() {
+                    out.push_str("  none\n");
+                }
+                for h in hs {
+                    out.push_str(&format!(
+                        "  #{} n={} by {} at {}\n<code>{}</code>\n",
+                        ji(h, "id"),
+                        ji(h, "n"),
+                        esc_html(&jstr(h, "worker")),
+                        esc_html(&jstr(h, "found_at")),
+                        esc_html(&jstr(h, "address"))
+                    ));
+                }
+            }
+            out
+        }
+        Err(e) => format!("debug_hits failed: {}", esc_html(&e)),
+    }
+}
+
+fn debug_system_text(coordinator: &str, key: &str) -> String {
+    match pg_call(coordinator, key, "ephil_debug_system", &serde_json::json!({})) {
+        Ok(v) => {
+            let mut out = String::from("<b>System</b>\n");
+            out.push_str(&format!("  now: {}\n", esc_html(&jstr(&v, "now"))));
+            out.push_str(&format!(
+                "  active runs: {} | live workers: {}\n",
+                ji(&v, "active_runs"),
+                ji(&v, "live_workers")
+            ));
+            if let Some(tc) = v.get("table_counts").and_then(|x| x.as_object()) {
+                let mut s = String::from("  tables: ");
+                for (k, x) in tc {
+                    s.push_str(&format!("{}={} ", k, x.as_i64().unwrap_or(0)));
+                }
+                out.push_str(&s);
+                out.push('\n');
+            }
+            if let Some(wbs) = v.get("work_by_status").and_then(|x| x.as_object()) {
+                let mut s = String::from("  work: ");
+                for (k, x) in wbs {
+                    s.push_str(&format!("{}={} ", k, x.as_i64().unwrap_or(0)));
+                }
+                out.push_str(&s);
+                out.push('\n');
+            }
+            out
+        }
+        Err(e) => format!("debug_system failed: {}", esc_html(&e)),
+    }
 }
