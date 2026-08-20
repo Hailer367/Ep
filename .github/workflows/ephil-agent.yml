@@ -6,7 +6,7 @@ on:
       duration_minutes:
         description: 'How long to run the agent (minutes)'
         required: true
-        default: '60'
+        default: '340'
         type: choice
         options:
           - '15'
@@ -16,6 +16,7 @@ on:
           - '180'
           - '240'
           - '300'
+          - '340'
   push:
     branches: [main]
   schedule:
@@ -32,6 +33,9 @@ jobs:
   agent:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
     steps:
       - name: Checkout ephil source
         uses: actions/checkout@v4
@@ -66,15 +70,27 @@ jobs:
 
       - name: Run agent for configured duration
         env:
-          DURATION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_minutes || '300' }}
+          DURATION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_minutes || '340' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           PID=$(cat agent.pid)
           DURATION=$((DURATION_MINUTES * 60))
           START=$(date +%s)
+          RELAUNCHED=0
           echo "agent pid $PID, running for ${DURATION_MINUTES} minutes"
           while kill -0 "$PID" 2>/dev/null; do
             NOW=$(date +%s)
             ELAPSED=$((NOW - START))
+            REMAINING=$((DURATION - ELAPSED))
+            if [ "$REMAINING" -le 600 ] && [ "$RELAUNCHED" -eq 0 ]; then
+              echo "10 minutes left, dispatching follow-up run"
+              if gh workflow run "$GITHUB_WORKFLOW" --ref "$GITHUB_REF_NAME" -f duration_minutes="$DURATION_MINUTES"; then
+                echo "follow-up run dispatched"
+              else
+                echo "follow-up dispatch failed"
+              fi
+              RELAUNCHED=1
+            fi
             if [ "$ELAPSED" -ge "$DURATION" ]; then
               echo "duration reached, requesting graceful shutdown"
               kill -TERM "$PID"
